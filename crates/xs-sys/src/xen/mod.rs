@@ -495,6 +495,7 @@ impl RealXen {
         let mut a = abi::MmapBatchV2 {
             num: 1,
             dom,
+            pad: 0,
             addr: m.as_ptr() as u64,
             arr: arr.as_ptr(),
             err: err.as_mut_ptr(),

@@ -28,6 +28,9 @@ use xs_sys::{Epoll, Event, Interest};
 #[derive(Debug)]
 pub struct Options {
     pub socket: PathBuf,
+    /// The mode the socket is given once bound, before it listens. None:
+    /// what the umask leaves, as oxenstored (`ox/utils.ml:81-88`).
+    pub socket_mode: Option<u32>,
     /// `--disable-socket`: serve the rings only.
     pub disable_socket: bool,
     /// False with `--no-domain-init`: no Xen at all, the socket only.
@@ -170,7 +173,9 @@ pub(crate) struct Reactor<X> {
 
 /// Creates the socket like oxenstored does (`ox/utils.ml:81-88`): missing
 /// directories are created with mode 0700, a stale socket is replaced.
-fn bind(path: &Path) -> io::Result<UnixListener> {
+/// With `mode`, the socket gets it before it listens, so that no client
+/// connects before (C xenstored: 0600, `cx417/xenstored_core.c:2588`).
+fn bind(path: &Path, mode: Option<u32>) -> io::Result<UnixListener> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty() && !d.exists()) {
         std::fs::create_dir_all(dir)?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
@@ -180,6 +185,9 @@ fn bind(path: &Path) -> io::Result<UnixListener> {
         _ => {}
     }
     let listener = UnixListener::bind(path)?;
+    if let Some(mode) = mode {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
     xs_sys::listen(&listener, 4096)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
@@ -220,7 +228,8 @@ pub fn run<X: XenBackend>(
     let listener = match opts.disable_socket {
         true => None,
         false => {
-            Some(bind(&opts.socket).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", opts.socket.display())))?)
+            let bound = bind(&opts.socket, opts.socket_mode);
+            Some(bound.map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", opts.socket.display())))?)
         }
     };
     let exe = std::env::current_exe()
@@ -589,14 +598,38 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rxenstored-bind-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let sock = dir.join("sub/socket");
-        let l = bind(&sock).unwrap();
+        let l = bind(&sock, None).unwrap();
         let mode = std::fs::metadata(sock.parent().unwrap()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
         drop(l);
-        let _l = bind(&sock).unwrap();
+        let _l = bind(&sock, None).unwrap();
         assert!(UnixStream::connect(&sock).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(bind(Path::new("/proc/rxenstored-cannot/socket")).is_err());
+        assert!(bind(Path::new("/proc/rxenstored-cannot/socket"), None).is_err());
+    }
+
+    /// The socket's mode: what the umask leaves without one (that of a
+    /// socket bound here by hand), the one given otherwise, whatever the
+    /// umask; a client connects either way.
+    #[test]
+    #[cfg_attr(miri, ignore = "AF_UNIX sockets: not emulated by Miri")]
+    fn bind_gives_the_socket_its_mode_if_asked() {
+        let dir = std::env::temp_dir().join(format!("rxenstored-bind-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let by_hand = dir.join("by-hand");
+        drop(UnixListener::bind(&by_hand).unwrap());
+        let sock = dir.join("socket");
+        let _l = bind(&sock, None).unwrap();
+        assert_eq!(mode(&sock), mode(&by_hand));
+        assert!(UnixStream::connect(&sock).is_ok());
+        for m in [0o600, 0o640] {
+            let _l = bind(&sock, Some(m)).unwrap();
+            assert_eq!(mode(&sock), m);
+            assert!(UnixStream::connect(&sock).is_ok());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A directory that exists keeps its mode; a path that cannot be
@@ -608,11 +641,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o751)).unwrap();
-        drop(bind(&dir.join("socket")).unwrap());
+        drop(bind(&dir.join("socket"), Some(0o600)).unwrap());
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o751);
         std::fs::create_dir(dir.join("taken")).unwrap();
-        let e = bind(&dir.join("taken")).unwrap_err();
+        let e = bind(&dir.join("taken"), None).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EISDIR), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }

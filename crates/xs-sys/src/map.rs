@@ -62,7 +62,8 @@ impl Mapping {
     /// # Safety
     /// `ptr` is the start of a live mapping of `len` bytes that nothing
     /// else unmaps; it is unmapped when the value is dropped, and
-    /// `after_unmap` runs after that.
+    /// `after_unmap` runs after that. A mapping starts on a page boundary;
+    /// `ring::Ring::new` refuses one that does not.
     pub unsafe fn from_raw(ptr: NonNull<u8>, len: usize, after_unmap: Option<AfterUnmap>) -> Mapping {
         Mapping { ptr, len, after_unmap }
     }

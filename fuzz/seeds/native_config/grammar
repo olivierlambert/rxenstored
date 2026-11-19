@@ -1,0 +1,6 @@
+  # indented comment
+	quota-nodes	=	5 
+log-level=info
+log = /a = b
+access-log = syslog:authpriv
+conflict-max-history-seconds = 0

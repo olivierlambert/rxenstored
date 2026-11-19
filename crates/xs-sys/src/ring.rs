@@ -137,8 +137,15 @@ impl Page {
         if map.len() < PAGE_SIZE {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a ring needs a whole page"));
         }
-        // Mappings start on a page boundary, so every word is aligned.
-        debug_assert_eq!(map.as_ptr() as usize % PAGE_SIZE, 0);
+        // The words are accessed as `AtomicU32`, which must be aligned: a
+        // page boundary aligns them all. Every mapping starts on one; a
+        // pointer handed to `Mapping::from_raw` might not.
+        if !map.as_ptr().cast::<u8>().addr().is_multiple_of(PAGE_SIZE) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a ring page must start on a page boundary",
+            ));
+        }
         Ok(Page { map })
     }
 
@@ -147,7 +154,8 @@ impl Page {
     fn word(&self, f: Field) -> &AtomicU32 {
         // SAFETY: `f.offset() + 4 <= 2076 < PAGE_SIZE <= map.len()`, so the
         // word is inside the mapping, which lives as long as `self`; it is
-        // 4-aligned (`new`). This module accesses it only as an `AtomicU32`
+        // 4-aligned (`new` checks the page is aligned, and the offset is a
+        // multiple of 4). This module accesses it only as an `AtomicU32`
         // (the queues, `queue`, end where the words start).
         unsafe { AtomicU32::from_ptr(self.map.as_ptr().add(f.offset()).cast()) }
     }
@@ -537,6 +545,24 @@ mod tests {
         assert_eq!(Ring::new(short).err().unwrap().kind(), io::ErrorKind::InvalidInput);
         let short = f.mapping(100);
         assert_eq!(GuestRing::new(short).err().unwrap().kind(), io::ErrorKind::InvalidInput);
+        // A page that does not start on a page boundary: refused, in
+        // release builds too (the words would be misaligned atomics).
+        let two = crate::fd::memfd("xs-sys-ring-2", 2 * PAGE_SIZE as u64).unwrap();
+        let both = two.map(0, 2 * PAGE_SIZE).unwrap();
+        for off in [1, 4, 2048] {
+            // SAFETY: inside `both`, which outlives it; the refused view is
+            // dropped, and its `munmap` of an address not on a page
+            // boundary fails (EINVAL) without touching `both`.
+            let m =
+                unsafe { Mapping::from_raw(std::ptr::NonNull::new(both.as_ptr().add(off)).unwrap(), PAGE_SIZE, None) };
+            let e = Ring::new(m).err().unwrap();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(e.to_string(), "a ring page must start on a page boundary");
+        }
+        // `both` is still mapped.
+        // SAFETY: inside `both`; this test is the only user of the file.
+        unsafe { both.as_ptr().add(PAGE_SIZE).write(7) };
+        drop(both);
         fn send<T: Send>() {}
         send::<Ring>();
         send::<GuestRing>();

@@ -100,6 +100,36 @@ fn reap(pid: libc::pid_t) {
     {}
 }
 
+/// The `Threads:` line of a `/proc/PID/status` text.
+fn threads_in_status(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Threads:"))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+/// Ok if this process has a single thread, which `fork` needs for the
+/// child to start from a consistent state; else why not (or that it
+/// cannot tell: no /proc).
+fn single_threaded() -> io::Result<()> {
+    one_thread_in(std::fs::read_to_string("/proc/self/status"))
+}
+
+/// `single_threaded` on what reading `/proc/self/status` gave.
+fn one_thread_in(status: io::Result<String>) -> io::Result<()> {
+    let status = status.map_err(|e| io::Error::new(e.kind(), format!("/proc/self/status: {e}")))?;
+    match threads_in_status(&status) {
+        Some(1) => Ok(()),
+        Some(n) => Err(io::Error::other(format!(
+            "cannot become a daemon with {n} threads: fork keeps only the calling one"
+        ))),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "/proc/self/status: no thread count",
+        )),
+    }
+}
+
 /// Detaches from the caller as oxenstored does (`ox/stdext.ml:118-139`):
 /// fork, new session, fork again so that the daemon is not a session
 /// leader and cannot acquire a terminal, stdin and stdout on /dev/null.
@@ -108,15 +138,23 @@ fn reap(pid: libc::pid_t) {
 /// `daemonize` returns `Parent` once the daemon has reported through its
 /// `Readiness` (or has died), so that whoever started it finds it ready.
 ///
-/// Must be called while the process has a single thread: the children
-/// keep only the calling thread, and a lock another thread held at the
-/// fork (in the allocator, in stdio) would stay locked in them for ever.
-// cov:excl-start daemonize
+/// Fails, without forking, if the process has more than one thread: the
+/// children would keep only the calling thread, and a lock another thread
+/// held at the fork (in stdio, in the environment) would stay locked in
+/// them for ever.
 pub fn daemonize(keep_stderr: bool) -> io::Result<Daemonized> {
+    single_threaded()?;
+    fork_twice(keep_stderr)
+}
+
+/// `daemonize` once the process is known to have a single thread.
+// cov:excl-start daemonize
+fn fork_twice(keep_stderr: bool) -> io::Result<Daemonized> {
     let (r, w) = io::pipe()?;
-    // SAFETY: the caller guarantees a single thread (see above), so the
-    // child starts from a consistent state; both processes own copies of
-    // the same descriptors, each dropping the end it does not use.
+    // SAFETY: the process has a single thread (`daemonize` checked it,
+    // and nothing here starts one), so the child starts from a consistent
+    // state; both processes own copies of the same descriptors, each
+    // dropping the end it does not use.
     match unsafe { libc::fork() } {
         -1 => Err(io::Error::last_os_error()),
         0 => {
@@ -224,6 +262,55 @@ mod tests {
         assert!(read_report(File::options().write(true).open("/dev/null").unwrap())
             .unwrap_err()
             .starts_with("readiness pipe: "));
+    }
+
+    #[test]
+    fn the_thread_count_is_read_from_proc_status() {
+        assert_eq!(threads_in_status("Name:\tx\nThreads:\t1\nSigQ:\t0/1\n"), Some(1));
+        assert_eq!(threads_in_status("Threads:   12\n"), Some(12));
+        assert_eq!(threads_in_status("Name:\tx\n"), None);
+        assert_eq!(threads_in_status("Threads:\tmany\n"), None);
+        assert!(one_thread_in(Ok("Threads:\t1\n".into())).is_ok());
+        let e = one_thread_in(Ok("Threads:\t3\n".into())).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "cannot become a daemon with 3 threads: fork keeps only the calling one"
+        );
+        let e = one_thread_in(Ok("Name:\tx\n".into())).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let e = one_thread_in(Err(io::Error::from_raw_os_error(libc::ENOENT))).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(e.to_string().starts_with("/proc/self/status: "), "{e}");
+    }
+
+    /// A process with another thread is refused before any fork: the
+    /// test harness, with a thread of the test's own to be sure.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "reads /proc/self/status, which counts the host's threads, not Miri's"
+    )]
+    fn daemonize_refuses_a_process_with_threads() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let r = daemonize(true);
+        drop(tx);
+        other.join().unwrap();
+        match r {
+            Err(e) => assert!(
+                e.to_string().contains("threads: fork keeps only the calling one"),
+                "{e}"
+            ),
+            // Had it forked, the copy of the harness must not go on.
+            Ok(Daemonized::Daemon(_)) => {
+                // SAFETY: ends the forked copy at once.
+                unsafe { libc::_exit(0) }
+            }
+            Ok(Daemonized::Parent(p)) => panic!("forked with threads: {p:?}"),
+        }
+        assert!(single_threaded().is_err());
     }
 
     #[test]

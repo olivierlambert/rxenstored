@@ -97,7 +97,7 @@ for c in "${CRATES[@]}"; do
     echo "== $SAN $c"
     start=$(date +%s)
     set +e
-    cargo +nightly test -Zbuild-std --target "$TARGET" -p "$c" "${features[@]}" --lib --bins --tests \
+    cargo +nightly test --no-fail-fast -Zbuild-std --target "$TARGET" -p "$c" "${features[@]}" --lib --bins --tests \
         -- "${skips[@]}" >"$OUT/$c.log" 2>&1
     rc=$?
     set -e

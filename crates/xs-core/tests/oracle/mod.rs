@@ -5,12 +5,20 @@
 //! `model.rs`). Shared with the fuzz target `core_vs_model` (fuzz/),
 //! which drives the same generator with the fuzzer's bytes instead of a
 //! seeded random generator: every choice is a `Source::below`.
+//!
+//! With the native profile (`Profile::Native`) the model follows its six
+//! rules (`xs_core::Rules`) and is oxenstored's otherwise: quotas refuse
+//! with ENOSPC; a quota of N allows N watches and N transactions; CONTROL
+//! from a guest is EACCES; a guest owns, and is counted for, the nodes it
+//! creates; a WRITE or MKDIR that fails leaves the store as it was; a
+//! missing node is EACCES to a caller that may not access its nearest
+//! existing ancestor as the request asks.
 
 // Each of the two users of this module uses part of it.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use xs_core::{Config, ConnId, Core, Status};
+use xs_core::{Config, ConnId, Core, Profile, Status};
 use xs_wire::{write_header, MsgType};
 
 pub type P = Vec<Vec<u8>>;
@@ -53,6 +61,17 @@ pub fn owner(perms: &[u8]) -> u32 {
         .unwrap()
         .parse()
         .unwrap()
+}
+
+/// The permissions of a node `who` creates below one with `parent`'s: the
+/// parent's, or in the native profile, for a guest, the parent's with the
+/// guest as owner.
+pub fn created(parent: &[u8], who: Who, native: bool) -> Vec<u8> {
+    if !native || is_dom0(who) {
+        return parent.to_vec();
+    }
+    let end = parent.iter().position(|c| *c == 0).unwrap();
+    [&parent[..1], who.0.to_string().as_bytes(), &parent[end..]].concat()
 }
 
 pub struct MWatch {
@@ -122,6 +141,43 @@ pub struct Model {
     version: u64,
     conns: Vec<MConn>,
     q: Quotas,
+    /// The native profile's rules.
+    native: bool,
+}
+
+/// The error of a quota.
+pub fn quota_error(native: bool) -> &'static str {
+    if native {
+        "ENOSPC"
+    } else {
+        "EQUOTA"
+    }
+}
+
+/// Is a count of `n` at a quota of `max` (watches, transactions)? A quota
+/// of N allows N + 1, or N in the native profile.
+pub fn full(n: usize, max: usize, native: bool) -> bool {
+    if native {
+        n >= max
+    } else {
+        n > max
+    }
+}
+
+/// The nearest node of `store` above `p`, which does not exist: a node
+/// that does not exist is ENOENT, or in the native profile EACCES to a
+/// caller that may not `want` (`b'r'`, `b'w'`) that node.
+pub fn missing(store: &Store, p: &[Vec<u8>], who: Who, want: u8, native: bool) -> &'static str {
+    let above = (0..p.len())
+        .rev()
+        .map(|k| &p[..k])
+        .find(|a| store.contains_key(*a))
+        .unwrap();
+    if native && !allowed(&store[above].perms, who, want) {
+        "EACCES"
+    } else {
+        "ENOENT"
+    }
 }
 
 /// Whether a request replaced the store's root: any WRITE, SET_PERMS or RM
@@ -145,11 +201,13 @@ pub struct Quotas {
 
 /// The node quota a store operation runs under: the limit if the caller
 /// is held, and for a transaction the store and the transaction's start,
-/// whose difference with its own store it adds to the store's counts.
+/// whose difference with its own store it adds to the store's counts;
+/// and the profile.
 #[derive(Clone, Copy)]
 pub struct Ent<'a> {
     max: Option<usize>,
     txn: Option<(&'a Store, &'a Store)>,
+    native: bool,
 }
 
 /// Nodes of `owner` in a store, the root aside.
@@ -252,23 +310,42 @@ pub fn parse_perms(s: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `create_implicit_path`: the missing ancestors of `p`, each needing
-/// room in its owner's quota and write access to its parent, and getting
-/// its permissions.
-pub fn implicit_parents(store: &mut Store, p: &P, who: Who, e: Ent) -> Result<(), &'static str> {
-    for i in 1..p.len() {
-        if !store.contains_key(&p[..i]) {
-            let perms = store[&p[..i - 1]].perms.clone();
-            if room(store, e, owner(&perms)) == 0 {
-                return Err("EQUOTA");
-            }
-            if !allowed(&perms, who, b'w') {
-                return Err("EACCES");
-            }
-            store.insert(p[..i].to_vec(), MNode { value: vec![], perms });
-        }
+/// The missing nodes of `p` (`create_implicit_path`, and a MKDIR's own
+/// node), as the core's `Missing` makes them (`store.rs`): the room in
+/// their owner's quota is taken once, at the first, which needs room and
+/// write access to its parent; all get its permissions (`created`); as many
+/// are made as the room allows, and the request fails if that is not all.
+/// Per node, the room would be larger in one case: in a transaction whose
+/// changes uncount more of an owner's nodes than the store now counts
+/// (removed in it and by others since it started), the count is held at 0
+/// (`quota::txn_count`) while the first nodes made bring it back up.
+/// Returns the room left, or None if nothing was missing.
+pub fn create_missing(store: &mut Store, p: &[Vec<u8>], who: Who, e: Ent) -> Result<Option<usize>, &'static str> {
+    let Some(first) = (1..=p.len()).find(|i| !store.contains_key(&p[..*i])) else {
+        return Ok(None);
+    };
+    let parent = &store[&p[..first - 1]].perms;
+    let perms = created(parent, who, e.native);
+    let room = room(store, e, owner(&perms));
+    if room == 0 {
+        return Err(quota_error(e.native));
     }
-    Ok(())
+    if !allowed(parent, who, b'w') {
+        return Err("EACCES");
+    }
+    for (made, i) in (first..=p.len()).enumerate() {
+        if made == room {
+            return Err(quota_error(e.native));
+        }
+        store.insert(
+            p[..i].to_vec(),
+            MNode {
+                value: vec![],
+                perms: perms.clone(),
+            },
+        );
+    }
+    Ok(Some(room - (p.len() + 1 - first)))
 }
 
 pub fn check(store: &Store, p: &[Vec<u8>], who: Who, want: u8) -> Result<(), &'static str> {
@@ -280,7 +357,7 @@ pub fn check(store: &Store, p: &[Vec<u8>], who: Who, want: u8) -> Result<(), &'s
 }
 
 pub fn op_write(store: &mut Store, p: P, v: &[u8], who: Who, e: Ent, changes: &mut Vec<Change>) -> R {
-    implicit_parents(store, &p, who, e)?;
+    let left = create_missing(store, &p[..p.len().saturating_sub(1)], who, e)?;
     if v.len() > 2048 {
         return Err("E2BIG");
     }
@@ -288,11 +365,18 @@ pub fn op_write(store: &mut Store, p: P, v: &[u8], who: Who, e: Ent, changes: &m
         check(store, &p, who, b'w')?;
         store.get_mut(&p).unwrap().value = v.to_vec();
     } else {
-        if room(store, e, owner(&store[parent(&p)].perms)) == 0 {
-            return Err("EQUOTA");
+        let perms = created(&store[parent(&p)].perms, who, e.native);
+        // After missing parents, the node needs the room left by them in
+        // the native profile (every check before the first node is made),
+        // the room counted again otherwise (`store.rs`, `Op::Write`).
+        let room = match left {
+            Some(left) if e.native => left,
+            _ => room(store, e, owner(&perms)),
+        };
+        if room == 0 {
+            return Err(quota_error(e.native));
         }
         check(store, parent(&p), who, b'w')?;
-        let perms = store[parent(&p)].perms.clone();
         store.insert(
             p.clone(),
             MNode {
@@ -310,22 +394,16 @@ pub fn op_mkdir(store: &mut Store, p: P, who: Who, e: Ent, changes: &mut Vec<Cha
         changes.push(Change::Normal(p, vec![store.clone()]));
         return Ok(ok());
     }
-    implicit_parents(store, &p, who, e)?;
     if store.contains_key(&p) {
         check(store, &p, who, b'w')?;
         return Ok(ok());
     }
-    if room(store, e, owner(&store[parent(&p)].perms)) == 0 {
-        return Err("EQUOTA");
-    }
-    check(store, parent(&p), who, b'w')?;
-    let perms = store[parent(&p)].perms.clone();
-    store.insert(p.clone(), MNode { value: vec![], perms });
+    create_missing(store, &p, who, e)?;
     changes.push(Change::Normal(p, vec![store.clone()]));
     Ok(ok())
 }
 
-pub fn op_rm(store: &mut Store, p: P, who: Who, changes: &mut Vec<Change>) -> R {
+pub fn op_rm(store: &mut Store, p: P, who: Who, native: bool, changes: &mut Vec<Change>) -> R {
     if p.is_empty() {
         check(store, &p, who, b'w')?;
         let before = store.clone();
@@ -334,20 +412,22 @@ pub fn op_rm(store: &mut Store, p: P, who: Who, changes: &mut Vec<Change>) -> R 
         return Ok(ok());
     }
     if !store.contains_key(parent(&p)) {
-        return Err("ENOENT");
+        return Err(missing(store, parent(&p), who, b'w', native));
     }
     if store.contains_key(&p) {
         check(store, &p, who, b'w')?;
         let before = store.clone();
         store.retain(|k, _| !k.starts_with(&p));
         changes.push(Change::Rm(p, before));
+    } else if native {
+        check(store, parent(&p), who, b'w')?;
     }
     Ok(ok())
 }
 
-pub fn op_setperms(store: &mut Store, p: P, perms: Vec<u8>, who: Who, changes: &mut Vec<Change>) -> R {
+pub fn op_setperms(store: &mut Store, p: P, perms: Vec<u8>, who: Who, native: bool, changes: &mut Vec<Change>) -> R {
     let Some(node) = store.get(&p) else {
-        return Err("ENOENT");
+        return Err(missing(store, &p, who, b'w', native));
     };
     if owner(&node.perms) != owner(&perms) && !is_dom0(who) {
         return Err("EACCES");
@@ -379,11 +459,14 @@ pub fn store_op(
     };
     let t = MsgType::from_u32(ty).unwrap();
     let mut changes = Vec::new();
+    // A WRITE or MKDIR that fails leaves the store as it was, in the
+    // native profile.
+    let undo = (e.native && matches!(t, MsgType::Write | MsgType::Mkdir)).then(|| store.clone());
     let r = match t {
         MsgType::Read | MsgType::GetPerms | MsgType::Directory => match one() {
             None => Err("EINVAL"),
             Some(p) => match store.get(&p) {
-                None => Err("ENOENT"),
+                None => Err(missing(store, &p, who, b'r', e.native)),
                 Some(n) if !allowed(&n.perms, who, b'r') => Err("EACCES"),
                 Some(n) => Ok(match t {
                     MsgType::Read => n.value.clone(),
@@ -412,25 +495,28 @@ pub fn store_op(
         },
         MsgType::Rm => match one() {
             None => Err("EINVAL"),
-            Some(p) => op_rm(store, p, who, &mut changes),
+            Some(p) => op_rm(store, p, who, e.native, &mut changes),
         },
         MsgType::SetPerms => match split(payload, 2)[..] {
             [p, perms] => match (parse_path(p, home), parse_perms(perms)) {
                 (Some(_), Some(perms)) if !is_dom0(who) && perms.iter().filter(|c| **c == 0).count() - 1 > acl_max => {
-                    Err("EQUOTA")
+                    Err(quota_error(e.native))
                 }
-                (Some(p), Some(perms)) => op_setperms(store, p, perms, who, &mut changes),
+                (Some(p), Some(perms)) => op_setperms(store, p, perms, who, e.native, &mut changes),
                 _ => Err("EINVAL"),
             },
             _ => Err("EINVAL"),
         },
         _ => unreachable!(),
     };
+    if let (Some(before), Err(_)) = (undo, &r) {
+        *store = before;
+    }
     (r, changes)
 }
 
 impl Model {
-    fn new(q: Quotas) -> Model {
+    fn new(q: Quotas, native: bool) -> Model {
         let mut store = Store::new();
         let n = |v: &[u8]| MNode {
             value: v.to_vec(),
@@ -446,6 +532,7 @@ impl Model {
             version: 0,
             conns: Vec::new(),
             q,
+            native,
         }
     }
 
@@ -525,9 +612,10 @@ impl Model {
         // Requests per transaction, before anything else.
         let q = self.q;
         let held = !is_dom0(who);
+        let native = self.native;
         let requests = self.conns[ci].txns.get(&tid).map_or(0, |t| t.requests);
         if held && requests >= q.request_max {
-            out.push((ci, reply(Err("EQUOTA"))));
+            out.push((ci, reply(Err(quota_error(native)))));
             return out;
         }
         if let Some(t) = self.conns[ci].txns.get_mut(&tid) {
@@ -552,7 +640,7 @@ impl Model {
                         payload,
                         who,
                         &home,
-                        Ent { max, txn: None },
+                        Ent { max, txn: None, native },
                         q.acl_max,
                     );
                     self.version += replaces(ty, &before, &self.store, &changes) as u64;
@@ -572,6 +660,7 @@ impl Model {
                         Ent {
                             max,
                             txn: Some((global, snap)),
+                            native,
                         },
                         q.acl_max,
                     );
@@ -593,7 +682,7 @@ impl Model {
                     };
                     let c = &mut self.conns[ci];
                     let pos = c.watches.iter().position(|w| w.apath == apath && w.token == token);
-                    let full = held && c.watches.len() > q.watch_max;
+                    let full = held && full(c.watches.len(), q.watch_max, native);
                     if mt == Some(MsgType::Unwatch) {
                         match pos {
                             Some(i) => {
@@ -610,7 +699,7 @@ impl Model {
                         };
                         match key {
                             None => Err("EINVAL"),
-                            Some(_) if full => Err("EQUOTA"),
+                            Some(_) if full => Err(quota_error(native)),
                             Some(_) if pos.is_some() => Err("EEXIST"),
                             Some(key) => {
                                 let relative = node[0] != b'/' && node[0] != b'@';
@@ -633,8 +722,8 @@ impl Model {
             Some(MsgType::TransactionStart) => {
                 if tid != 0 {
                     out.push((ci, reply(Err("EBUSY"))));
-                } else if held && self.conns[ci].txns.len() > q.transaction_max {
-                    out.push((ci, reply(Err("EQUOTA"))));
+                } else if held && full(self.conns[ci].txns.len(), q.transaction_max, native) {
+                    out.push((ci, reply(Err(quota_error(native)))));
                 } else {
                     let c = &mut self.conns[ci];
                     let mut t = c.next_tid.max(1);
@@ -683,8 +772,8 @@ impl Model {
                                 let who = if unchanged { *then } else { who };
                                 let max = (!is_dom0(who)).then_some(q.entity_max);
                                 let before = store.clone();
-                                let (r, c) =
-                                    store_op(&mut store, *ty, payload, who, &home, Ent { max, txn: None }, q.acl_max);
+                                let e = Ent { max, txn: None, native };
+                                let (r, c) = store_op(&mut store, *ty, payload, who, &home, e, q.acl_max);
                                 replaced |= replaces(*ty, &before, &store, &c);
                                 if enc(&r) != *recorded {
                                     same = false;
@@ -750,6 +839,12 @@ impl Model {
                         }
                     }
                 };
+                out.push((ci, reply(r)));
+            }
+            // `print` only logs: OK for domain 0, and for a guest OK, or
+            // EACCES in the native profile.
+            Some(MsgType::Control) => {
+                let r = if held && native { Err("EACCES") } else { Ok(ok()) };
                 out.push((ci, reply(r)));
             }
             _ => out.push((ci, reply(Err("ENOSYS")))),
@@ -833,7 +928,10 @@ pub fn gen_path(rng: &mut impl Source) -> Vec<u8> {
     }
 }
 
-pub fn gen_request(rng: &mut impl Source, open: &[u32]) -> (u32, u32, Vec<u8>) {
+/// A request on a connection with transactions `open`. In the native
+/// profile a CONTROL `print` comes among the requests of the last branch;
+/// the choices of the other profile are as they were.
+pub fn gen_request(rng: &mut impl Source, open: &[u32], native: bool) -> (u32, u32, Vec<u8>) {
     let tx = match rng.below(10) {
         0..=4 => 0,
         5 => 99,
@@ -883,14 +981,11 @@ pub fn gen_request(rng: &mut impl Source, open: &[u32]) -> (u32, u32, Vec<u8>) {
             MsgType::TransactionEnd,
             rng.pick(&[&b"T\0"[..], b"T\0", b"F\0", b"X\0"]).to_vec(),
         ),
-        _ => (
-            if rng.below(2) == 0 {
-                MsgType::ResetWatches
-            } else {
-                MsgType::GetDomainPath
-            },
-            b"5\0".to_vec(),
-        ),
+        _ => match rng.below(if native { 3 } else { 2 }) {
+            0 => (MsgType::ResetWatches, b"5\0".to_vec()),
+            1 => (MsgType::GetDomainPath, b"5\0".to_vec()),
+            _ => (MsgType::Control, b"print\0model\0".to_vec()),
+        },
     };
     (ty as u32, tx, payload)
 }
@@ -935,7 +1030,8 @@ pub struct Seen {
     pub guest_writes: usize,
     /// Watch events delivered to a guest.
     pub guest_events: usize,
-    /// Requests refused with EQUOTA.
+    /// Requests refused by a quota (EQUOTA, or ENOSPC in the native
+    /// profile).
     pub quota: usize,
 }
 
@@ -952,9 +1048,11 @@ pub struct Pair {
 }
 
 impl Pair {
-    /// The watch index keyed by `key`.
-    pub fn new(q: Quotas, key: [u64; 2]) -> Pair {
+    /// The watch index keyed by `key`, the core and the model in profile
+    /// `profile`.
+    pub fn new(q: Quotas, profile: Profile, key: [u64; 2]) -> Pair {
         let cfg = Config {
+            profile,
             entity_max: q.entity_max,
             watch_max: Some(q.watch_max),
             transaction_max: Some(q.transaction_max),
@@ -966,7 +1064,7 @@ impl Pair {
         };
         let mut pair = Pair {
             core: Core::new(cfg, key),
-            model: Model::new(q),
+            model: Model::new(q, profile == Profile::Native),
             ids: Vec::new(),
             trace: std::env::var_os("ORACLE_TRACE").is_some(),
         };
@@ -1072,7 +1170,7 @@ impl Pair {
         for (c, msgs) in expect.iter().enumerate() {
             for m in msgs {
                 seen.denied += (m.0 == 16 && m.3 == b"EACCES\0") as usize;
-                seen.quota += (m.0 == 16 && m.3 == b"EQUOTA\0") as usize;
+                seen.quota += (m.0 == 16 && (m.3 == b"EQUOTA\0" || m.3 == b"ENOSPC\0")) as usize;
                 seen.guest_writes += (DOMIDS[c].is_some() && is_write && tx == 0 && m.0 == ty) as usize;
                 seen.guest_events += (DOMIDS[c].is_some() && m.0 == 15) as usize;
             }
@@ -1105,10 +1203,19 @@ impl Pair {
 }
 
 /// Up to `steps` steps of choices from `rng` (fewer if it is `done`), with
-/// the watch index keyed by `key`. `seed` only names the run in messages.
-pub fn run(rng: &mut impl Source, seed: u64, key: [u64; 2], steps: usize, q: Quotas, seen: &mut Seen) {
-    let name = format!("seed {seed}");
-    let mut pair = Pair::new(q, key);
+/// the watch index keyed by `key`, in profile `profile`. `seed` only names
+/// the run in messages.
+pub fn run(
+    rng: &mut impl Source,
+    seed: u64,
+    key: [u64; 2],
+    steps: usize,
+    q: Quotas,
+    profile: Profile,
+    seen: &mut Seen,
+) {
+    let name = format!("seed {seed} ({profile:?})");
+    let mut pair = Pair::new(q, profile, key);
     for step in 0..steps {
         if rng.done() {
             break;
@@ -1118,7 +1225,7 @@ pub fn run(rng: &mut impl Source, seed: u64, key: [u64; 2], steps: usize, q: Quo
             pair.reopen(ci, step);
             continue;
         }
-        let (ty, tx, payload) = gen_request(rng, &pair.open_txns(ci));
+        let (ty, tx, payload) = gen_request(rng, &pair.open_txns(ci), profile == Profile::Native);
         let _ = pair.step(&name, step, ci, ty, tx, &payload, seen);
     }
     pair.check_store(&format!("{name} at the end"));

@@ -64,7 +64,7 @@ impl Daemon {
         )
         .unwrap();
         let child = command
-            .args(["--no-fork", "--no-domain-init", "--config-file"])
+            .args(["--compat=oxenstored", "--no-fork", "--no-domain-init", "--config-file"])
             .arg(&config)
             .arg("--socket")
             .arg(&socket)

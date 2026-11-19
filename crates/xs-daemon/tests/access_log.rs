@@ -34,6 +34,13 @@ use xs_wire::MsgType;
 
 const BIN: &str = env!("CARGO_BIN_EXE_rxenstored");
 
+/// rxenstored with oxenstored's command line and oxenstored.conf.
+fn rx() -> Command {
+    let mut c = Command::new(BIN);
+    c.arg("--compat=oxenstored");
+    c
+}
+
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
 struct Run {
@@ -56,7 +63,7 @@ impl Run {
             format!("pid-file = {}/pid\n{conf}", dir.display()),
         )
         .unwrap();
-        let child = Command::new(BIN)
+        let child = rx()
             .args(["--no-fork", "--no-domain-init", "--config-file"])
             .arg(dir.join("oxenstored.conf"))
             .arg("--socket")

@@ -1,0 +1,6 @@
+# rxenstored.conf: the defaults
+
+# quota-nodes = 1000
+log = syslog:daemon
+log-level = warn
+access-log = none

@@ -70,6 +70,7 @@ impl Daemon {
         let dir = fresh_dir();
         let mut opts = Options {
             socket: dir.join("run/socket"),
+            socket_mode: None,
             disable_socket: false,
             domain_init: true,
             // oxenstored's default.

@@ -33,6 +33,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use xs_core::Profile;
 use xs_sim::Op;
 use xs_sys::backend::DomainState;
 use xs_sys::ring::{
@@ -1247,69 +1248,75 @@ fn a_device_that_keeps_failing_is_read_less_and_less_often() {
 
 #[test]
 fn xsa_325_a_guest_that_breaks_the_protocol_is_ignored_until_it_dies() {
-    let d = Daemon::start();
-    let mut c = d.client();
-    let mut w = d.client();
-    w.watch("@releaseDomain", "rel");
-    w.wait_events(1);
-    let mut g = d.vm(&mut c, 5);
-    let mut other = d.vm(&mut c, 6);
-    g.watch("x", "t");
-    let mut bad = Vec::new();
-    xs_wire::write_header(&mut bad, MsgType::Write as u32, 1, 0, PAYLOAD_MAX as u32 + 1);
-    g.g.ring().write(&bad).unwrap();
-    g.g.notify();
-    eventually("ignored", || g.field(Field::Error) == ERROR_PROTO);
-    // XSA-420: it may notify as it likes, its port stays masked.
-    let before = d.cpu_ticks();
-    for _ in 0..10_000 {
+    // In both profiles.
+    for profile in [Profile::Oxenstored, Profile::Native] {
+        let d = Daemon::start_with(|o, _| o.config.profile = profile);
+        let mut c = d.client();
+        let mut w = d.client();
+        w.watch("@releaseDomain", "rel");
+        w.wait_events(1);
+        let mut g = d.vm(&mut c, 5);
+        let mut other = d.vm(&mut c, 6);
+        g.watch("x", "t");
+        let mut bad = Vec::new();
+        xs_wire::write_header(&mut bad, MsgType::Write as u32, 1, 0, PAYLOAD_MAX as u32 + 1);
+        g.g.ring().write(&bad).unwrap();
         g.g.notify();
+        eventually("ignored", || g.field(Field::Error) == ERROR_PROTO);
+        // XSA-420: it may notify as it likes, its port stays masked.
+        let before = d.cpu_ticks();
+        for _ in 0..10_000 {
+            g.g.notify();
+        }
+        sync(&mut c);
+        assert!(d.cpu_ticks() - before <= 20, "{} ticks", d.cpu_ticks() - before);
+        // The others are served; it stays known, without its watch.
+        assert_eq!(other.read("x"), Err("ENOENT".into()));
+        assert!(introduced(&mut c, 5));
+        let watches = String::from_utf8(c.ok(MsgType::Control, 0, b"watches\0")).unwrap();
+        assert!(!watches.contains("D5"), "{watches}");
+        // Its death is seen: @releaseDomain, its port unbound, its nodes gone.
+        d.hv.destroy_domain(5).unwrap();
+        w.wait_events(2);
+        assert!(!introduced(&mut c, 5) && !d.hv.is_bound(5));
+        assert_eq!(c.read(0, "/local/domain/5"), Err("ENOENT".into()));
     }
-    sync(&mut c);
-    assert!(d.cpu_ticks() - before <= 20, "{} ticks", d.cpu_ticks() - before);
-    // The others are served; it stays known, without its watch.
-    assert_eq!(other.read("x"), Err("ENOENT".into()));
-    assert!(introduced(&mut c, 5));
-    let watches = String::from_utf8(c.ok(MsgType::Control, 0, b"watches\0")).unwrap();
-    assert!(!watches.contains("D5"), "{watches}");
-    // Its death is seen: @releaseDomain, its port unbound, its nodes gone.
-    d.hv.destroy_domain(5).unwrap();
-    w.wait_events(2);
-    assert!(!introduced(&mut c, 5) && !d.hv.is_bound(5));
-    assert_eq!(c.read(0, "/local/domain/5"), Err("ENOENT".into()));
 }
 
 #[test]
 fn xsa_425_connections_that_go_while_others_wait_in_the_same_pass() {
-    let d = Daemon::start();
-    let mut c = d.client();
-    let mut g5 = d.vm(&mut c, 5);
-    let mut g6 = d.vm(&mut c, 6);
-    let ask = |g: &mut G, id: u32| {
-        g.g.ring().write(&request(MsgType::GetDomainPath, id, b"5\0")).unwrap();
-        g.g.notify();
-    };
-    // Requests of 5 and 6 waiting, and RELEASE of 6 from a socket.
-    ask(&mut g5, 1);
-    ask(&mut g6, 1);
-    c.ok(MsgType::Release, 0, b"6\0");
-    assert_eq!(g5.g.recv_message(T).unwrap().req_id, 1);
-    assert!(!d.hv.is_bound(6) && !introduced(&mut c, 6));
-    // A domain acting for domain 0 releases itself: no reply is written
-    // to the page it no longer has.
-    let mut g7 = d.vm(&mut c, 7);
-    c.ok(MsgType::SetTarget, 0, b"7\x000\0");
-    let prod = g7.field(Field::RspProd);
-    g7.g.send_request(MsgType::Release, 9, 0, b"7\0", T).unwrap();
-    eventually("released", || !d.hv.is_bound(7));
-    sync(&mut c);
-    assert_eq!(g7.field(Field::RspProd), prod);
-    // A domain that dies with requests waiting.
-    ask(&mut g5, 2);
-    d.hv.destroy_domain(5).unwrap();
-    eventually("dead", || !introduced(&mut c, 5));
-    assert!(!d.hv.is_bound(5));
-    assert_eq!(c.read(0, "/tool/xenstored").map(|v| v.is_empty()), Ok(false));
+    // In both profiles.
+    for profile in [Profile::Oxenstored, Profile::Native] {
+        let d = Daemon::start_with(|o, _| o.config.profile = profile);
+        let mut c = d.client();
+        let mut g5 = d.vm(&mut c, 5);
+        let mut g6 = d.vm(&mut c, 6);
+        let ask = |g: &mut G, id: u32| {
+            g.g.ring().write(&request(MsgType::GetDomainPath, id, b"5\0")).unwrap();
+            g.g.notify();
+        };
+        // Requests of 5 and 6 waiting, and RELEASE of 6 from a socket.
+        ask(&mut g5, 1);
+        ask(&mut g6, 1);
+        c.ok(MsgType::Release, 0, b"6\0");
+        assert_eq!(g5.g.recv_message(T).unwrap().req_id, 1);
+        assert!(!d.hv.is_bound(6) && !introduced(&mut c, 6));
+        // A domain acting for domain 0 releases itself: no reply is written
+        // to the page it no longer has.
+        let mut g7 = d.vm(&mut c, 7);
+        c.ok(MsgType::SetTarget, 0, b"7\x000\0");
+        let prod = g7.field(Field::RspProd);
+        g7.g.send_request(MsgType::Release, 9, 0, b"7\0", T).unwrap();
+        eventually("released", || !d.hv.is_bound(7));
+        sync(&mut c);
+        assert_eq!(g7.field(Field::RspProd), prod);
+        // A domain that dies with requests waiting.
+        ask(&mut g5, 2);
+        d.hv.destroy_domain(5).unwrap();
+        eventually("dead", || !introduced(&mut c, 5));
+        assert!(!d.hv.is_bound(5));
+        assert_eq!(c.read(0, "/tool/xenstored").map(|v| v.is_empty()), Ok(false));
+    }
 }
 
 #[test]

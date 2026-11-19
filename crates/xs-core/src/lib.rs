@@ -133,12 +133,99 @@ const DOMID_SELF: i64 = 0x7FF0;
 /// `DOMID_FIRST_RESERVED` (`xen.h`): this and above name no domain.
 const DOMID_FIRST_RESERVED: u32 = 0x7FF0;
 
+/// Which behaviour to follow where oxenstored 4.17 and C xenstored differ
+/// (`Rules`, decided once from the profile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// `--compat=oxenstored`, and `Config::default()`: oxenstored 4.17's
+    /// behaviour.
+    Oxenstored,
+    /// rxenstored's own command line and configuration file.
+    Native,
+}
+
+/// What a profile changes in how requests are handled: every point where
+/// the profiles differ reads one of these, and only `Profile::rules`
+/// sets them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rules {
+    /// The error of every quota on counts and bytes (nodes, watches,
+    /// transactions, requests and bytes of a transaction, ACL entries):
+    /// oxenstored's EQUOTA (`ox/process.ml:437-439`), or ENOSPC, C
+    /// xenstored's (`cx417/xenstored_core.c:1494-1496`). A value too long
+    /// is E2BIG in both.
+    pub quota_error: Errno,
+    /// A quota of N on watches and on open transactions allows N; without
+    /// it, N + 1, as oxenstored (`ox/connection.ml:277-280, 382-385`).
+    pub exact_counts: bool,
+    /// CONTROL from a domain other than 0 is EACCES, as in C xenstored
+    /// (`cx417/xenstored_core.c:2035-2037`); without it, OK and nothing
+    /// done (`ox/process.ml:221-223`).
+    pub control_is_privileged: bool,
+    /// A node created by a domain other than 0 that does not act for
+    /// domain 0 is owned by that domain (its own domid, also when it acts
+    /// for another through SET_TARGET), and counts in its quota: its
+    /// parent's permissions with the creator as owner
+    /// (`cx417/xenstored_core.c:1416-1424`, `conn->id`). Without it, a node
+    /// gets its parent's permissions, owner included, and counts for that
+    /// owner (`ox/store.ml:415-436`).
+    pub creator_owns: bool,
+    /// A WRITE or MKDIR that fails creates nothing (`cx417/xenstored_core.c:1515-1521`);
+    /// without it, the missing parents made before the failure stay
+    /// (`ox/process.ml:74-87, 301-308`).
+    pub all_or_nothing: bool,
+    /// A missing node is ENOENT only to a caller that may access its
+    /// nearest existing ancestor as the request asks (read, or write for
+    /// RM and SET_PERMS), and EACCES to others (`cx417/xenstored_core.c:936-950`);
+    /// without it, ENOENT to everybody (`ox/store.ml:178-181`).
+    pub hide_missing: bool,
+}
+
+impl Profile {
+    /// The rules of the profile.
+    pub const fn rules(self) -> Rules {
+        match self {
+            Profile::Oxenstored => Rules {
+                quota_error: Errno::EQUOTA,
+                exact_counts: false,
+                control_is_privileged: false,
+                creator_owns: false,
+                all_or_nothing: false,
+                hide_missing: false,
+            },
+            Profile::Native => Rules {
+                quota_error: Errno::ENOSPC,
+                exact_counts: true,
+                control_is_privileged: true,
+                creator_owns: true,
+                all_or_nothing: true,
+                hide_missing: true,
+            },
+        }
+    }
+}
+
+impl Rules {
+    /// Is a count of `n` at a quota of `max`, so that one more is refused?
+    pub fn full(&self, n: usize, max: usize) -> bool {
+        if self.exact_counts {
+            n >= max
+        } else {
+            n > max
+        }
+    }
+}
+
 /// The configuration. The quotas are oxenstored's (defaults: those of its
 /// code, `ox/define.ml:24-31`, `ox/quota.ml:22-23`); "held" connections
 /// are those of domains other than 0 that do not act for domain 0
-/// (`Perms.Connection.is_dom0`): sockets are domain 0.
+/// (`Perms.Connection.is_dom0`): sockets are domain 0. A quota refuses
+/// with the profile's error (`Rules::quota_error`): EQUOTA below, ENOSPC
+/// in the native profile.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// The behaviour profile, set by the daemon's front end (`Rules`).
+    pub profile: Profile,
     /// `quota-path-max`: longest path, or relative part of a
     /// `/local/domain/<n>/...` path.
     pub path_max: usize,
@@ -164,15 +251,18 @@ pub struct Config {
     pub quota_activate: bool,
     /// `quota-maxentity`: a held connection may create a node only while
     /// its owner (other than domain 0) owns fewer (`ox/store.ml:415-436`).
-    /// EQUOTA.
+    /// The owner is the parent's, or the creator with
+    /// `Rules::creator_owns`. EQUOTA.
     pub entity_max: usize,
     /// `quota-maxwatch` (None if not positive): a held connection may
     /// register a watch while it has at most this many, so one more than
-    /// this in all (`ox/connection.ml:277-280`). EQUOTA.
+    /// this in all (`ox/connection.ml:277-280`); this many with
+    /// `Rules::exact_counts`. EQUOTA.
     pub watch_max: Option<usize>,
     /// `quota-transaction` (None if not positive): a held connection may
     /// start a transaction while it has at most this many open, so one
-    /// more than this in all (`ox/connection.ml:382-385`). EQUOTA.
+    /// more than this in all (`ox/connection.ml:382-385`); this many with
+    /// `Rules::exact_counts`. EQUOTA.
     pub transaction_max: Option<usize>,
     /// `quota-maxrequests` (None if negative): requests of a held
     /// connection in one transaction; the next one, whatever it is, and
@@ -219,6 +309,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            profile: Profile::Oxenstored,
             path_max: path::PATH_MAX,
             value_max: store::VALUE_MAX,
             output_soft_limit: 1 << 20,
@@ -640,6 +731,8 @@ impl Conns {
 
 pub struct Core {
     cfg: Config,
+    /// The rules of `cfg.profile`.
+    rules: Rules,
     root: Arc<Node>,
     /// The node counts of `root`.
     entries: Entries,
@@ -829,6 +922,7 @@ impl Core {
         };
         let conflicts = Conflicts::new(&cfg);
         Core {
+            rules: cfg.profile.rules(),
             cfg,
             root,
             entries,
@@ -1221,8 +1315,9 @@ impl Core {
     fn count_request(&mut self, id: ConnId, peer: &Peer, tid: u32) -> Result<(), Errno> {
         let held = !peer.caller.is_dom0();
         let full = |n: usize| held && self.cfg.request_max.is_some_and(|max| n >= max);
+        let quota = self.rules.quota_error;
         if tid == 0 {
-            return if full(0) { Err(Errno::EQUOTA) } else { Ok(()) };
+            return if full(0) { Err(quota) } else { Ok(()) };
         }
         // oxenstored fails the lookup outside its error mapping (`ox/process.ml:713-720, 739`).
         let t = self
@@ -1232,7 +1327,7 @@ impl Core {
             .and_then(|c| c.txns.get_mut(&tid))
             .ok_or(Errno::EIO)?;
         if full(t.requests) {
-            return Err(Errno::EQUOTA);
+            return Err(quota);
         }
         t.requests += 1;
         Ok(())
@@ -1242,6 +1337,7 @@ impl Core {
         let active = self.cfg.quota_activate;
         Ctx {
             caller,
+            rules: self.rules,
             perms_active: self.cfg.perms_activate,
             value_max: if active { self.cfg.value_max } else { usize::MAX },
             entity_max: (active && !caller.is_dom0()).then_some(self.cfg.entity_max),
@@ -1403,9 +1499,13 @@ impl Core {
     /// unknown, malformed or that only log (`print`). Never an error in
     /// oxenstored; here ENOSYS for what needs what the core does not have:
     /// `live-update` (the daemon's) and `xenbus` (ring state). Master adds
-    /// `compact`, `trim` and others: OK in 4.17.
+    /// `compact`, `trim` and others: OK in 4.17. With
+    /// `Rules::control_is_privileged`, others get EACCES.
     fn control(&mut self, id: ConnId, peer: &Peer, msg: &Message, tid: u32) {
-        let reply = if Self::dom0_only(peer).is_err() {
+        let reply = if let Err(e) = Self::dom0_only(peer) {
+            if self.rules.control_is_privileged {
+                return self.conns.error(id, msg.req_id, tid, e);
+            }
             None
         } else {
             match path::split(&msg.payload, 8)[..] {
@@ -1505,7 +1605,7 @@ impl Core {
                 [path, perms] => {
                     let (path, perms) = (p(path)?, Perms::parse(perms)?);
                     if perms.acl.len() > self.cfg.acl_max && self.cfg.quota_activate && !peer.caller.is_dom0() {
-                        return Err(Errno::EQUOTA);
+                        return Err(self.rules.quota_error);
                     }
                     Op::SetPerms(path, Arc::new(perms))
                 }
@@ -1585,7 +1685,7 @@ impl Core {
                     .transaction_bytes_max
                     .is_some_and(|max| self.transaction_bytes(id) >= max)
             {
-                return self.conns.error(id, msg.req_id, tid, Errno::EQUOTA);
+                return self.conns.error(id, msg.req_id, tid, self.rules.quota_error);
             }
             // The transaction exists: `handle` checked it (`count_request`).
             let Some(txn) = self.conns.map.get_mut(&id).and_then(|c| c.txns.get_mut(&tid)) else {
@@ -1714,8 +1814,8 @@ impl Core {
         let Some(conn) = self.conns.map.get_mut(&id) else {
             return Err(Errno::EIO);
         };
-        if held && self.cfg.quota_activate && self.cfg.watch_max.is_some_and(|max| conn.watches > max) {
-            return Err(Errno::EQUOTA);
+        if held && self.cfg.quota_activate && self.cfg.watch_max.is_some_and(|max| self.rules.full(conn.watches, max)) {
+            return Err(self.rules.quota_error);
         }
         let tok = if *conn.last_token == *token {
             conn.last_token.clone()
@@ -1779,8 +1879,13 @@ impl Core {
         let Some(conn) = self.conns.map.get_mut(&id) else {
             return Err(Errno::EIO);
         };
-        if !peer.caller.is_dom0() && self.cfg.transaction_max.is_some_and(|max| conn.txns.len() > max) {
-            return Err(Errno::EQUOTA);
+        if !peer.caller.is_dom0()
+            && self
+                .cfg
+                .transaction_max
+                .is_some_and(|max| self.rules.full(conn.txns.len(), max))
+        {
+            return Err(self.rules.quota_error);
         }
         // Ids from 1 per connection, skipping open ones, wrapping below
         // 0x3fffffff (`ox/connection.ml:364-380`).

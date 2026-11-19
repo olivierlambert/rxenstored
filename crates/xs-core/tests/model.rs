@@ -13,7 +13,9 @@
 //! core's own counts are audited after every step.
 //!
 //! The model, the generator and the loop are in `oracle/`, which the fuzz
-//! target `core_vs_model` shares; this file runs them on seeded sequences.
+//! target `core_vs_model` shares; this file runs them on seeded sequences,
+//! in both profiles: oxenstored's, and the native one, whose rules the
+//! model follows when asked (`oracle` module documentation).
 
 // A test crate, not the daemon: it may unwrap, index, print and panic (the
 // no-panic rule of Cargo.toml is for code that is not a test).
@@ -39,10 +41,11 @@ mod oracle;
 
 use oracle::{run, Msg, Pair, Quotas, Recorder, Rng, Seen};
 use std::hash::BuildHasher;
+use xs_core::Profile;
 use xs_wire::MsgType;
 
 /// One seeded sequence of `steps` steps.
-fn run_seed(seed: u64, steps: usize, q: Quotas, seen: &mut Seen) {
+fn run_seed(seed: u64, steps: usize, q: Quotas, profile: Profile, seen: &mut Seen) {
     let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
     // A random key for the watch index, as the daemon draws it. A failed
     // test shows the key of each seed it ran (the harness prints what a
@@ -63,7 +66,7 @@ fn run_seed(seed: u64, steps: usize, q: Quotas, seen: &mut Seen) {
         }
     };
     println!("seed {seed}: XS_TEST_HASH_KEY={:#x},{:#x}", key[0], key[1]);
-    run(&mut rng, seed, key, steps, q, seen);
+    run(&mut rng, seed, key, steps, q, profile, seen);
 }
 
 /// `Config::default()`'s.
@@ -94,10 +97,19 @@ fn budget(seeds: std::ops::Range<u64>, steps: usize) -> (std::ops::Range<u64>, u
 
 #[test]
 fn core_agrees_with_the_naive_model() {
+    agrees(Profile::Oxenstored);
+}
+
+#[test]
+fn core_agrees_with_the_naive_model_in_the_native_profile() {
+    agrees(Profile::Native);
+}
+
+fn agrees(profile: Profile) {
     let mut seen = Seen::default();
     let (seeds, steps, full) = budget(0..300, 400);
     for seed in seeds {
-        run_seed(seed, steps, DEFAULT, &mut seen);
+        run_seed(seed, steps, DEFAULT, profile, &mut seen);
     }
     let Seen {
         commits,
@@ -121,6 +133,15 @@ fn core_agrees_with_the_naive_model() {
 
 #[test]
 fn core_agrees_with_the_naive_model_under_tight_quotas() {
+    agrees_under_tight_quotas(Profile::Oxenstored);
+}
+
+#[test]
+fn core_agrees_with_the_naive_model_under_tight_quotas_in_the_native_profile() {
+    agrees_under_tight_quotas(Profile::Native);
+}
+
+fn agrees_under_tight_quotas(profile: Profile) {
     let q = Quotas {
         entity_max: 4,
         watch_max: 2,
@@ -131,7 +152,7 @@ fn core_agrees_with_the_naive_model_under_tight_quotas() {
     let mut seen = Seen::default();
     let (seeds, steps, full) = budget(1000..1150, 400);
     for seed in seeds {
-        run_seed(seed, steps, q, &mut seen);
+        run_seed(seed, steps, q, profile, &mut seen);
     }
     let Seen {
         commits,
@@ -140,11 +161,11 @@ fn core_agrees_with_the_naive_model_under_tight_quotas() {
         guest_writes,
         ..
     } = seen;
-    println!("{commits} commits, {conflicts} conflicts, {quota} EQUOTA, {guest_writes} guest writes");
+    println!("{commits} commits, {conflicts} conflicts, {quota} refused by a quota, {guest_writes} guest writes");
     if !full {
         return;
     }
-    assert!(quota > 1000, "{quota} EQUOTA");
+    assert!(quota > 1000, "{quota} refused by a quota");
     assert!(
         commits > 100 && conflicts > 10 && guest_writes > 500,
         "{commits} {conflicts} {guest_writes}"
@@ -154,7 +175,7 @@ fn core_agrees_with_the_naive_model_under_tight_quotas() {
 /// Fixed requests (connection of `DOMIDS`, type, transaction, payload) made
 /// to both, which must agree at each; what the last one's connection got.
 fn script(steps: &[(usize, MsgType, u32, &[u8])]) -> Vec<Msg> {
-    let mut pair = Pair::new(DEFAULT, [1, 2]);
+    let mut pair = Pair::new(DEFAULT, Profile::Oxenstored, [1, 2]);
     let mut last = Vec::new();
     for (i, (ci, ty, tx, payload)) in steps.iter().enumerate() {
         last = pair.step("script", i, *ci, *ty as u32, *tx, payload, &mut Seen::default());
@@ -231,8 +252,8 @@ fn a_commit_run_again_fires_for_its_requests_as_they_ran() {
 }
 
 /// Seeds for the fuzz target `core_vs_model` (fuzz/): the choices of the
-/// first sequences of the two tests above, each after the target's mode
-/// byte (bit 0: tight quotas; key 0).
+/// first sequences of the four tests above, each after the target's mode
+/// byte (bit 0: tight quotas; bit 3: the native profile; key 0).
 #[test]
 #[ignore = "writes fuzz seeds: XS_FUZZ_SEEDS=DIR cargo test -p xs-core --test model -- --ignored"]
 fn write_fuzz_seeds() {
@@ -245,14 +266,24 @@ fn write_fuzz_seeds() {
         request_max: 5,
         acl_max: 1,
     };
-    for (mode, q, seeds) in [(0u8, DEFAULT, 0..8u64), (1, tight, 1000..1008)] {
+    for (mode, q, seeds) in [
+        (0u8, DEFAULT, 0..8u64),
+        (1, tight, 1000..1008),
+        (8, DEFAULT, 0..8),
+        (9, tight, 1000..1008),
+    ] {
+        let (profile, prefix) = if mode & 8 == 0 {
+            (Profile::Oxenstored, "model-seed")
+        } else {
+            (Profile::Native, "model-native-seed")
+        };
         for seed in seeds {
             let mut rec = Recorder {
                 inner: Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1),
                 choices: vec![mode],
             };
-            run(&mut rec, seed, [0, 0], 400, q, &mut Seen::default());
-            std::fs::write(dir.join(format!("model-seed-{seed}")), &rec.choices).unwrap();
+            run(&mut rec, seed, [0, 0], 400, q, profile, &mut Seen::default());
+            std::fs::write(dir.join(format!("{prefix}-{seed}")), &rec.choices).unwrap();
         }
     }
 }

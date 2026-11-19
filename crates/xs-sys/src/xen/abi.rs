@@ -117,11 +117,14 @@ pub(super) struct PrivcmdHypercall {
 }
 
 /// struct privcmd_mmapbatch_v2 (privcmd.h:73). `arr` is `const xen_pfn_t *`,
-/// and xen_pfn_t is `unsigned long` (Xen arch-x86/xen.h:59).
+/// and xen_pfn_t is `unsigned long` (Xen arch-x86/xen.h:59). The C
+/// structure has two bytes of padding after `dom`; here they are a field,
+/// so that what the kernel copies in is all written (zero).
 #[repr(C)]
 pub(super) struct MmapBatchV2 {
     pub num: u32,
     pub dom: u16,
+    pub pad: u16,
     pub addr: u64,
     pub arr: *const u64,
     pub err: *mut i32,
@@ -229,8 +232,8 @@ mod gntdev {
 pub(super) const VIRQ_DOM_EXC: u32 = 3;
 /// public/xen.h:110.
 pub(super) const HYPERVISOR_DOMCTL: u64 = 36;
-/// public/xen.h:562: ids from here up are not ordinary domains, and
-/// getdomaininfo refuses them (xen/common/domctl.c, EINVAL).
+/// public/xen.h:562: ids from here up are not ordinary domains; the
+/// daemon never asks Xen about them.
 pub(super) const DOMID_FIRST_RESERVED: u32 = 0x7FF0;
 
 /// public/domctl.h:24. Xen refuses any other value with EACCES
@@ -303,9 +306,13 @@ pub(super) fn getdomaininfo_request(domid: u16) -> [u8; DOMCTL_SIZE] {
     b
 }
 
-/// Reads the domctl after a successful call. Xen answers for the first
-/// domain whose id is at least the one asked (xen/common/domctl.c,
-/// `d->domain_id >= dom`), so another id means there is no such domain.
+/// Reads the domctl after a successful call, for the domain asked. Xen
+/// 4.17.6 looks the id up exactly and fails with ESRCH when there is no
+/// such domain (xen/common/domctl.c, `rcu_lock_domain_by_id`, since
+/// "domctl: Modify XEN_DOMCTL_getdomaininfo to fail if domid is not
+/// found"); Xen 4.17.0 answered instead for the first domain whose id is
+/// at least the one asked (`d->domain_id >= dom`). Another id in the reply
+/// therefore also means there is no such domain.
 pub(super) fn getdomaininfo_reply(asked: u16, b: &[u8; DOMCTL_SIZE]) -> Option<DomainInfo> {
     let domid = u16::from_ne_bytes([b[GETDOMAININFO_DOMAIN], b[GETDOMAININFO_DOMAIN + 1]]);
     const F: usize = GETDOMAININFO_FLAGS;
@@ -316,8 +323,8 @@ pub(super) fn getdomaininfo_reply(asked: u16, b: &[u8; DOMCTL_SIZE]) -> Option<D
     })
 }
 
-/// Turns a failed getdomaininfo into its meaning: ESRCH is no domain at
-/// or above the id asked; EACCES is first of all a hypervisor that does
+/// Turns a failed getdomaininfo into its meaning: ESRCH is no such domain
+/// (in 4.17.0: none at or above the id asked); EACCES is first of all a hypervisor that does
 /// not speak this interface version, which must not pass for a dead
 /// domain.
 pub(super) fn getdomaininfo_error(e: io::Error) -> io::Result<Option<DomainInfo>> {
@@ -463,9 +470,13 @@ mod tests {
         // privcmd.h:73: unsigned int num; domid_t dom; __u64 addr; pointers.
         assert_eq!(size_of::<MmapBatchV2>(), 32);
         assert_eq!(offset_of!(MmapBatchV2, dom), 4);
+        // The C padding, a field here: every byte is written.
+        assert_eq!(offset_of!(MmapBatchV2, pad), 6);
         assert_eq!(offset_of!(MmapBatchV2, addr), 8);
         assert_eq!(offset_of!(MmapBatchV2, arr), 16);
         assert_eq!(offset_of!(MmapBatchV2, err), 24);
+        // No padding left: the fields fill the size.
+        assert_eq!(4 + 2 + 2 + 8 + 8 + 8, size_of::<MmapBatchV2>());
     }
 
     #[test]

@@ -35,6 +35,13 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_rxenstored");
 
+/// rxenstored with oxenstored's command line and oxenstored.conf.
+fn rx() -> Command {
+    let mut c = Command::new(BIN);
+    c.arg("--compat=oxenstored");
+    c
+}
+
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
 /// A private directory with a configuration, removed on drop.
@@ -68,7 +75,7 @@ impl Sandbox {
 
     /// The command launch-xenstore runs, on private paths.
     fn command(&self) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = rx();
         c.arg("--no-domain-init")
             .arg("--config-file")
             .arg(self.path("oxenstored.conf"))
@@ -189,7 +196,7 @@ fn text(out: &Output) -> (String, String) {
 #[test]
 fn help_exits_0() {
     for argv in [&["--help"][..], &["-help"], &["--no-fork", "--help", "--bogus"]] {
-        let out = Command::new(BIN).args(argv).output().unwrap();
+        let out = rx().args(argv).output().unwrap();
         assert!(out.status.success(), "{argv:?}");
         let (stdout, _) = text(&out);
         assert!(
@@ -207,7 +214,7 @@ fn live_update_is_refused_even_with_help() {
         &["--restart"],
         &["--live", "--no-fork"],
     ] {
-        let out = Command::new(BIN).args(argv).output().unwrap();
+        let out = rx().args(argv).output().unwrap();
         assert_eq!(out.status.code(), Some(1), "{argv:?}");
         assert!(text(&out).1.contains("live update) are not supported"), "{argv:?}");
     }
@@ -220,7 +227,7 @@ fn option_errors() {
         (&["--pid-file"], "option '--pid-file' needs an argument"),
         (&["--no-fork=1"], "expects no argument"),
     ] {
-        let out = Command::new(BIN).args(argv).output().unwrap();
+        let out = rx().args(argv).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{argv:?}");
         let (_, stderr) = text(&out);
         assert!(stderr.contains(message) && stderr.contains("usage:"), "{stderr}");
@@ -231,7 +238,7 @@ fn option_errors() {
 fn config_test() {
     let s = Sandbox::new();
     let good = s.path("oxenstored.conf");
-    let out = Command::new(BIN)
+    let out = rx()
         .arg("--config-test")
         .arg("--config-file")
         .arg(&good)
@@ -248,7 +255,7 @@ fn config_test() {
         ("persistent = true\n", "persistent = true is not supported"),
     ] {
         let bad = s.config(conf);
-        let out = Command::new(BIN)
+        let out = rx()
             .args(["--config-test", "--config-file"])
             .arg(&bad)
             .output()
@@ -261,7 +268,7 @@ fn config_test() {
             "{stderr}"
         );
     }
-    let out = Command::new(BIN)
+    let out = rx()
         .args(["--config-test", "--config-file"])
         .arg(s.path("missing"))
         .output()
@@ -439,7 +446,7 @@ fn a_start_without_xen_devices_fails_clearly() {
         s.path("no-port").display()
     ));
     for fork in [true, false] {
-        let mut c = Command::new(BIN);
+        let mut c = rx();
         c.arg("--config-file")
             .arg(s.path("oxenstored.conf"))
             .arg("--pid-file")

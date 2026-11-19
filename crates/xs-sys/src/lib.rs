@@ -74,11 +74,8 @@ pub fn listen(fd: &impl AsRawFd, backlog: i32) -> io::Result<()> {
 pub const SIGINT: i32 = libc::SIGINT;
 pub const SIGTERM: i32 = libc::SIGTERM;
 
-/// Signals as readable events: blocks `signals` in the calling thread
-/// (and in the threads it starts later) and returns a non-blocking
-/// descriptor that is readable while one of them is pending. The daemon
-/// calls it once, before it starts any thread.
-pub fn signal_fd(signals: &[i32]) -> io::Result<OwnedFd> {
+/// The set of `signals`.
+fn sigset(signals: &[i32]) -> io::Result<libc::sigset_t> {
     // SAFETY: `set` is a valid, writable sigset_t for every call; it is
     // initialised by sigemptyset before it is read.
     unsafe {
@@ -89,10 +86,37 @@ pub fn signal_fd(signals: &[i32]) -> io::Result<OwnedFd> {
                 return Err(io::Error::last_os_error());
             }
         }
-        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc));
-        }
+        Ok(set)
+    }
+}
+
+fn block(set: &libc::sigset_t) -> io::Result<()> {
+    // SAFETY: `set` is a valid sigset_t; a null old set is allowed.
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, set, std::ptr::null_mut()) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
+}
+
+/// Blocks `signals` in the calling thread and in the threads and
+/// processes it starts later: one that comes meanwhile stays pending, and
+/// a `signal_fd` of them made later reads it. Blocking them again is
+/// harmless.
+pub fn block_signals(signals: &[i32]) -> io::Result<()> {
+    block(&sigset(signals)?)
+}
+
+/// Signals as readable events: blocks `signals` in the calling thread
+/// (and in the threads it starts later) and returns a non-blocking
+/// descriptor that is readable while one of them is pending, including
+/// one that came while they were blocked before the call. The daemon
+/// calls it once, before it starts any thread.
+pub fn signal_fd(signals: &[i32]) -> io::Result<OwnedFd> {
+    let set = sigset(signals)?;
+    block(&set)?;
+    // SAFETY: `set` is a valid sigset_t.
+    unsafe {
         let fd = libc::signalfd(-1, &set, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -441,6 +465,22 @@ mod tests {
         let (a, b) = UnixStream::pair().unwrap();
         (&b).write_all(b"short").unwrap();
         assert_eq!(read_signal(&a).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A signal that comes after `block_signals` and before `signal_fd`
+    /// waits, and the descriptor reads it: a start-up window loses none.
+    #[test]
+    #[cfg_attr(miri, ignore = "signal masks and signalfd: not emulated by Miri")]
+    fn a_signal_blocked_before_the_descriptor_is_read_from_it() {
+        block_signals(&[libc::SIGUSR1]).unwrap();
+        block_signals(&[libc::SIGUSR1]).unwrap();
+        // SAFETY: plain call; the signal is blocked in this thread, so it
+        // stays pending.
+        unsafe { libc::raise(libc::SIGUSR1) };
+        let fd = signal_fd(&[libc::SIGUSR1]).unwrap();
+        assert_eq!(read_signal(&fd).unwrap(), Some(libc::SIGUSR1));
+        assert_eq!(read_signal(&fd).unwrap(), None);
+        assert!(block_signals(&[100_000]).is_err());
     }
 
     /// Descriptor 0 is a descriptor like any other: a process whose stdin

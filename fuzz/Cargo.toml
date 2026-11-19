@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Fuzz targets (cargo-fuzz, libFuzzer). Not a member of the main workspace:
+# its own workspace and Cargo.lock, so `cargo test --workspace` and the gates
+# do not build it. See README.md; run with scripts/fuzz.sh.
+[package]
+name = "rxenstored-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-2.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+libc = "0.2"
+xs-wire = { path = "../crates/xs-wire" }
+xs-core = { path = "../crates/xs-core" }
+xs-sys = { path = "../crates/xs-sys" }
+xs-daemon = { path = "../crates/xs-daemon" }
+
+[workspace]
+members = ["."]
+
+# cargo fuzz builds with --release: keep the checks of a debug build
+# (debug_assert!, xs-core's `impossible()`, integer overflow) on.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "core_requests"
+path = "fuzz_targets/core_requests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_requests_native"
+path = "fuzz_targets/core_requests_native.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_vs_model"
+path = "fuzz_targets/core_vs_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ring"
+path = "fuzz_targets/ring.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "options"
+path = "fuzz_targets/options.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_config"
+path = "fuzz_targets/native_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_options"
+path = "fuzz_targets/native_options.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_format"
+path = "fuzz_targets/log_format.rs"
+test = false
+doc = false
+bench = false

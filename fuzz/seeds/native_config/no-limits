@@ -1,0 +1,13 @@
+quota-nodes = 0
+quota-watches = 0
+quota-transactions = 0
+quota-outstanding = 0
+quota-path-max = 0
+quota-value-size = 0
+quota-node-permissions = 0
+quota-transaction-requests = 0
+quota-watch-events = 0
+quota-transaction-bytes = 0
+ring-scan-interval = 18446744073709551615
+conflict-max-history-seconds = 99999999999999999999999
+conflict-burst-limit = .5

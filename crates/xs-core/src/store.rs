@@ -16,6 +16,7 @@ use crate::perms::{Access, Caller, Perms};
 use crate::pmap::PMap;
 use crate::prelude::*;
 use crate::quota::Acct;
+use crate::{Profile, Rules};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use xs_wire::Errno;
@@ -79,19 +80,25 @@ fn deepest<'a>(root: &'a Node, path: &[Name]) -> (usize, &'a Node) {
     (path.len(), n)
 }
 
-/// Walks to `path`, creating missing nodes (they inherit their parent's
-/// permissions, `ox/store.ml:266, 283`), and calls `f` on the node. A
-/// missing node is made, and what goes below it, before it is inserted.
-fn walk_create<R>(n: &mut Node, path: &[Name], gen: &mut Gen, f: impl FnOnce(&mut Node, &mut Gen) -> R) -> R {
+/// Walks to `path`, creating missing nodes with permissions `perms`
+/// (`Missing`), and calls `f` on the node. A missing node is made, and
+/// what goes below it, before it is inserted.
+fn walk_create<R>(
+    n: &mut Node,
+    path: &[Name],
+    gen: &mut Gen,
+    perms: &Arc<Perms>,
+    f: impl FnOnce(&mut Node, &mut Gen) -> R,
+) -> R {
     let Some((name, rest)) = path.split_first() else {
         return f(n, gen);
     };
     match n.children.get_mut(&**name) {
-        Some(child) => walk_create(child, rest, gen, f),
+        Some(child) => walk_create(child, rest, gen, perms, f),
         None => {
             let g = gen.bump();
-            let mut child = Node::new(n.perms.clone(), Bytes::EMPTY, g);
-            let r = walk_create(&mut child, rest, gen, f);
+            let mut child = Node::new(perms.clone(), Bytes::EMPTY, g);
+            let r = walk_create(&mut child, rest, gen, perms, f);
             n.children.insert(name.clone(), child);
             n.cgen = g;
             r
@@ -181,6 +188,8 @@ pub enum Outcome {
 #[derive(Clone, Copy, Debug)]
 pub struct Ctx {
     pub caller: Caller,
+    /// The profile's rules.
+    pub rules: Rules,
     /// `perms-activate`: without it, only a change of owner is refused.
     pub perms_active: bool,
     pub value_max: usize,
@@ -192,6 +201,7 @@ impl Ctx {
     /// Domain 0 with checks on and no limit on values.
     pub const DOM0: Ctx = Ctx {
         caller: Caller::DOM0,
+        rules: Profile::Oxenstored.rules(),
         perms_active: true,
         value_max: usize::MAX,
         entity_max: None,
@@ -199,6 +209,33 @@ impl Ctx {
 
     fn can(&self, node: &Node, want: Access) -> Result<(), Errno> {
         node.perms.check(self.perms_active, &self.caller, want)
+    }
+
+    /// The permissions of a node created below one with `parent`: those,
+    /// or with `Rules::creator_owns` and a caller other than domain 0,
+    /// those with the caller as owner. The record is shared when it does
+    /// not change.
+    fn created(&self, parent: &Arc<Perms>) -> Arc<Perms> {
+        let owner = i64::from(self.caller.domid);
+        if self.rules.creator_owns && !self.caller.is_dom0() && parent.owner != owner {
+            Arc::new(Perms {
+                owner,
+                ..(**parent).clone()
+            })
+        } else {
+            parent.clone()
+        }
+    }
+
+    /// The error for `path`, which does not exist, asked for `want`:
+    /// ENOENT, or with `Rules::hide_missing` EACCES to a caller that may
+    /// not `want` its nearest existing ancestor.
+    fn missing(&self, root: &Node, path: &[Name], want: Access) -> Errno {
+        if self.rules.hide_missing && self.can(deepest(root, path).1, want).is_err() {
+            Errno::EACCES
+        } else {
+            Errno::ENOENT
+        }
     }
 }
 
@@ -209,13 +246,16 @@ impl Ctx {
 ///
 /// Access is checked as oxenstored does (`ox/store.ml:257-356`): on the
 /// node itself, never on the way to it, so a missing node is ENOENT to
-/// everybody; a node that does not exist yet needs write access to its
-/// parent, and missing parents to the deepest existing one, whose
-/// permissions they get (`ox/process.ml:74-87`).
+/// everybody (but with `Rules::hide_missing`); a node that does not exist
+/// yet needs write access to its parent, and missing parents to the
+/// deepest existing one, whose permissions they get (`ox/process.ml:74-87`;
+/// with `Rules::creator_owns`, `Ctx::created`).
 ///
 /// A node that does not exist yet must also fit in its owner's quota,
 /// checked before the access (`ox/store.ml:415-436`); missing parents are
-/// created one by one, so those that fit stay when the quota runs out.
+/// created one by one, so those that fit stay when the quota runs out
+/// (none with `Rules::all_or_nothing`: a request that fails makes
+/// nothing).
 pub fn execute(
     root: &mut Arc<Node>,
     gen: &mut Gen,
@@ -261,35 +301,68 @@ pub fn execute_in(
 
 /// The node of a READ, DIRECTORY or GET_PERMS.
 fn readable<'a>(root: &'a Node, p: &Path, ctx: &Ctx) -> Result<&'a Node, Errno> {
-    let n = lookup(root, p).ok_or(Errno::ENOENT)?;
+    let n = lookup(root, p).ok_or_else(|| ctx.missing(root, p, Access::Read))?;
     ctx.can(n, Access::Read).map(|()| n)
 }
 
-/// Creates what is missing of `path`: each node a MKDIR
+/// What is missing of a path, to be created: each node a MKDIR
 /// (`ox/process.ml:74-87`, `ox/store.ml:429-436`), its owner's quota then
-/// access to its parent. They all get the permissions of the deepest node
-/// that exists, so its owner and the same answer.
-fn create_missing(root: &mut Arc<Node>, gen: &mut Gen, path: &[Name], ctx: &Ctx, acct: &mut Acct) -> Result<(), Errno> {
-    let (depth, deepest) = deepest(root, path);
-    let owner = deepest.perms.owner;
-    let room = acct.room(owner, ctx.entity_max);
-    if room == 0 {
-        return Err(Errno::EQUOTA);
+/// access to its parent. They all get the same permissions, those
+/// `Ctx::created` gives below the deepest node that exists, so the same
+/// owner and the same answer.
+struct Missing {
+    /// Components of the path that exist.
+    depth: usize,
+    /// The permissions of the nodes to create.
+    perms: Arc<Perms>,
+    /// Nodes their owner's quota has room for.
+    room: usize,
+}
+
+impl Missing {
+    /// Checks the first node to create below the deepest that exists of
+    /// `path`: its owner's quota, then write access to that node.
+    fn of(root: &Node, path: &[Name], ctx: &Ctx, acct: &Acct) -> Result<Missing, Errno> {
+        let (depth, deepest) = deepest(root, path);
+        let perms = ctx.created(&deepest.perms);
+        let room = acct.room(perms.owner, ctx.entity_max);
+        if room == 0 {
+            return Err(ctx.rules.quota_error);
+        }
+        ctx.can(deepest, Access::Write)?;
+        Ok(Missing { depth, perms, room })
     }
-    ctx.can(deepest, Access::Write)?;
-    let n = room.min(path.len() - depth);
-    // `depth + n` is at most `path.len()`.
-    walk_create(
-        Arc::make_mut(root),
-        path.get(..depth + n).unwrap_or(path),
-        gen,
-        |_, _| (),
-    );
-    acct.add(owner, n as isize);
-    if depth + n < path.len() {
-        return Err(Errno::EQUOTA);
+
+    /// Creates the missing nodes of `path` (whose `Missing` this is) that
+    /// the quota has room for, and fails if that is not all of them; with
+    /// `Rules::all_or_nothing`, creates none then.
+    fn create(
+        &self,
+        root: &mut Arc<Node>,
+        gen: &mut Gen,
+        path: &[Name],
+        ctx: &Ctx,
+        acct: &mut Acct,
+    ) -> Result<(), Errno> {
+        let missing = path.len() - self.depth;
+        if self.room < missing && ctx.rules.all_or_nothing {
+            return Err(ctx.rules.quota_error);
+        }
+        let n = self.room.min(missing);
+        // `depth + n` is at most `path.len()`.
+        walk_create(
+            Arc::make_mut(root),
+            path.get(..self.depth + n).unwrap_or(path),
+            gen,
+            &self.perms,
+            |_, _| (),
+        );
+        acct.add(self.perms.owner, n as isize);
+        if n < missing {
+            return Err(ctx.rules.quota_error);
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// A change that may fire watches: its kind, and the store before it if
@@ -338,54 +411,77 @@ fn run(
                 return Ok((Outcome::Done, Some((ChangeKind::Write, None))));
             };
             let (depth, parent_node) = deepest(root, parent);
-            if depth < parent.len() {
-                // New parents have the owner and permissions of the deepest
-                // node that exists, which `create_missing` checks, and no
-                // child yet.
-                let owner = parent_node.perms.owner;
-                create_missing(root, gen, parent, ctx, acct)?;
+            let quota = ctx.rules.quota_error;
+            // The permissions of the node if it is new: those of the
+            // parents created for it, if any.
+            let perms = if depth < parent.len() {
+                // New parents have the permissions `Missing` gives them,
+                // and no child yet.
+                let missing = Missing::of(root, parent, ctx, acct)?;
+                let parents = parent.len() - depth;
+                if ctx.rules.all_or_nothing {
+                    // Nothing is made before every check has passed, which
+                    // give the answer of the order below.
+                    if missing.room < parents {
+                        return Err(quota);
+                    }
+                    if value.len() > value_max {
+                        return Err(Errno::E2BIG);
+                    }
+                    if missing.room == parents {
+                        return Err(quota);
+                    }
+                }
+                missing.create(root, gen, parent, ctx, acct)?;
                 if value.len() > value_max {
                     // Missing parents are created before the size is checked
                     // (`ox/process.ml:305-310`, `ox/store.ml:415-423`).
                     return Err(Errno::E2BIG);
                 }
-                if acct.room(owner, ctx.entity_max) == 0 {
-                    return Err(Errno::EQUOTA);
+                if acct.room(missing.perms.owner, ctx.entity_max) == 0 {
+                    return Err(quota);
                 }
+                missing.perms
             } else {
                 if value.len() > value_max {
                     return Err(Errno::E2BIG);
                 }
                 match parent_node.child(name) {
-                    Some(node) => ctx.can(node, Access::Write)?,
+                    Some(node) => {
+                        ctx.can(node, Access::Write)?;
+                        // Not used: nothing is created.
+                        node.perms.clone()
+                    }
                     None => {
-                        if acct.room(parent_node.perms.owner, ctx.entity_max) == 0 {
-                            return Err(Errno::EQUOTA);
+                        let perms = ctx.created(&parent_node.perms);
+                        if acct.room(perms.owner, ctx.entity_max) == 0 {
+                            return Err(quota);
                         }
                         ctx.can(parent_node, Access::Write)?;
+                        perms
                     }
                 }
-            }
-            let created = walk_create(Arc::make_mut(root), parent, gen, |n, gen| {
+            };
+            let created = walk_create(Arc::make_mut(root), parent, gen, &perms, |n, gen| {
                 match n.children.get_mut(&**name) {
                     Some(child) => {
                         if child.value != *value {
                             child.value = value.clone();
                             child.vgen = gen.bump();
                         }
-                        None
+                        false
                     }
                     None => {
                         let g = gen.bump();
                         n.children
-                            .insert(name.clone(), Node::new(n.perms.clone(), value.clone(), g));
+                            .insert(name.clone(), Node::new(perms.clone(), value.clone(), g));
                         n.cgen = g;
-                        Some(n.perms.owner)
+                        true
                     }
                 }
             });
-            if let Some(owner) = created {
-                acct.add(owner, 1);
+            if created {
+                acct.add(perms.owner, 1);
             }
             (Outcome::Done, Some((ChangeKind::Write, None)))
         }
@@ -401,7 +497,7 @@ fn run(
                 ctx.can(node, Access::Write)?;
                 return Ok((Outcome::Done, None));
             }
-            create_missing(root, gen, p, ctx, acct)?;
+            Missing::of(root, p, ctx, acct)?.create(root, gen, p, ctx, acct)?;
             (Outcome::Done, Some((ChangeKind::Mkdir, None)))
         }
         Op::Rm(p) => {
@@ -418,9 +514,14 @@ fn run(
                 return Ok((Outcome::Done, Some((ChangeKind::Rm, before))));
             };
             // A missing ancestor is an error; a missing node is not
-            // (`ox/store.ml:189-203`, `ox/process.ml:320-325`).
-            let parent_node = lookup(root, parent).ok_or(Errno::ENOENT)?;
+            // (`ox/store.ml:189-203`, `ox/process.ml:320-325`), but with
+            // `Rules::hide_missing` to who may not write its parent
+            // (`cx417/xenstored_core.c:1701-1716`).
+            let parent_node = lookup(root, parent).ok_or_else(|| ctx.missing(root, parent, Access::Write))?;
             let Some(node) = parent_node.child(name) else {
+                if ctx.rules.hide_missing {
+                    ctx.can(parent_node, Access::Write)?;
+                }
                 return Ok((Outcome::Done, None));
             };
             // Only the node is checked: neither its parent nor what is below.
@@ -434,7 +535,7 @@ fn run(
             (Outcome::Done, Some((ChangeKind::Rm, before)))
         }
         Op::SetPerms(p, perms) => {
-            let node = lookup(root, p).ok_or(Errno::ENOENT)?;
+            let node = lookup(root, p).ok_or_else(|| ctx.missing(root, p, Access::Write))?;
             // Only domain 0 changes the owner, whatever `perms-activate`
             // says (`ox/store.ml:447-449`).
             if node.perms.owner != perms.owner && !ctx.caller.is_dom0() {

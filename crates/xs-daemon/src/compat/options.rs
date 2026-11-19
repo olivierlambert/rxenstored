@@ -5,7 +5,8 @@
 //! it: options in order, a value either in the next argument (whatever it
 //! looks like) or after `=` in the same one, other arguments ignored,
 //! `--help` ending the parse. Plus rxenstored's own `--socket PATH` and
-//! `--foreground` (the same as `--no-fork`).
+//! `--foreground` (the same as `--no-fork`). `--compat=oxenstored`, which
+//! selects this command line, is taken out before (`main.rs`, `select`).
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
@@ -14,7 +15,9 @@ pub const DEFAULT_SOCKET: &str = "/var/run/xenstored/socket";
 pub const DEFAULT_CONFIG: &str = "/etc/xen/oxenstored.conf";
 
 pub const USAGE: &str = "\
-usage: rxenstored [OPTION]...
+usage: rxenstored --compat=oxenstored [OPTION]...
+  (oxenstored's command line and oxenstored.conf; without --compat,
+  rxenstored's own: rxenstored --help)
   --config-file FILE  configuration file (default /etc/xen/oxenstored.conf)
   --config-test       check the configuration file and exit
   --no-fork           stay in the foreground (also --foreground)

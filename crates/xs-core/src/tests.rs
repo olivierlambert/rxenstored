@@ -110,12 +110,43 @@ fn ty(t: MsgType) -> u32 {
     t as u32
 }
 
+std::thread_local! {
+    /// The profile `H::with` gives every core it makes, if set (`in_profile`).
+    static PROFILE: std::cell::Cell<Option<Profile>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `test` with every core the harness makes in `profile`.
+fn in_profile(profile: Profile, test: fn()) {
+    PROFILE.set(Some(profile));
+    test();
+    PROFILE.set(None);
+}
+
+/// The rules of the cores the harness makes now.
+fn rules() -> Rules {
+    PROFILE.get().unwrap_or(Profile::Oxenstored).rules()
+}
+
+/// The name of the error of a quota, for the cores the harness makes now.
+fn quota_error() -> &'static str {
+    rules().quota_error.name()
+}
+
+/// Does the harness make cores in the native profile now?
+fn native() -> bool {
+    PROFILE.get() == Some(Profile::Native)
+}
+
 impl H {
     fn new() -> H {
         H::with(Config::default())
     }
 
     fn with(cfg: Config) -> H {
+        let cfg = Config {
+            profile: PROFILE.get().unwrap_or(cfg.profile),
+            ..cfg
+        };
         H {
             core: Core::new(cfg, random_key()),
             req: 100,
@@ -2425,6 +2456,54 @@ fn control_quota_in_a_transaction_counts_the_store_it_started_from_with_its_chan
     assert_eq!(quota(&mut h, a, 0, "0"), "dom0 quota: 7/1000");
 }
 
+/// oxenstored checks the node quota in a transaction against the counts
+/// copied at TRANSACTION_START, changed by the transaction's own requests
+/// (`ox/transaction.ml:127`, `ox/store.ml:415-444`, `ox/quota.ml:52-64`).
+/// Here the counts are the store's of now plus the transaction's changes,
+/// held at 0 (`quota.rs`, `txn_count`): when others removed nodes the
+/// transaction removed too, the hold gives the guest more room in its
+/// transaction than oxenstored's, and more with one node per request than
+/// with several in one (the room of a request is taken once, `Missing`).
+/// The commit runs the requests again on the store of then, so what it
+/// publishes keeps to the quota either way. Found by `core_vs_model`
+/// in its second night; the model now does as the core.
+#[test]
+#[ignore = "differs from oxenstored: a transaction's node counts are the store's of now plus its changes"]
+fn in_a_transaction_the_node_quota_counts_from_the_store_it_started_from() {
+    let (mut h, a, g) = with_guest(Config {
+        entity_max: 4,
+        profile: Profile::Oxenstored,
+        ..Config::default()
+    });
+    // Domain 5 owns its home and two nodes below it: 3.
+    h.one(a, MsgType::Mkdir, "/local/domain/5/r1");
+    h.one(a, MsgType::Mkdir, "/local/domain/5/r2");
+    let t = h.start(g);
+    h.ok(g, MsgType::Rm, t, b"r1\0");
+    h.ok(g, MsgType::Rm, t, b"r2\0");
+    // oxenstored's count in the transaction: 3 - 2 = 1. Others remove the
+    // same two nodes: the store's count is 1, the transaction's changes -2.
+    h.ok(a, MsgType::Rm, 0, b"/local/domain/5/r1\0");
+    h.ok(a, MsgType::Rm, 0, b"/local/domain/5/r2\0");
+    // One request that makes four nodes: three fit (1 to 4), as in
+    // oxenstored, whose missing parents are MKDIRs of their own.
+    assert_eq!(h.err(g, MsgType::Mkdir, t, b"m/a/b/c\0"), "EQUOTA");
+    assert_eq!(h.err(g, MsgType::Mkdir, t, b"n\0"), "EQUOTA", "at 4 of 4");
+    h.end(g, t, false).unwrap();
+    // One node per request: three, then the quota.
+    h.one(a, MsgType::Mkdir, "/local/domain/5/r1");
+    h.one(a, MsgType::Mkdir, "/local/domain/5/r2");
+    let t = h.start(g);
+    h.ok(g, MsgType::Rm, t, b"r1\0");
+    h.ok(g, MsgType::Rm, t, b"r2\0");
+    h.ok(a, MsgType::Rm, 0, b"/local/domain/5/r1\0");
+    h.ok(a, MsgType::Rm, 0, b"/local/domain/5/r2\0");
+    for n in ["n1", "n2", "n3"] {
+        h.ok(g, MsgType::Mkdir, t, format!("{n}\0").as_bytes());
+    }
+    assert_eq!(h.err(g, MsgType::Mkdir, t, b"n4\0"), "EQUOTA", "at 4 of 4");
+}
+
 #[test]
 fn xsa_272_every_way_of_creating_a_node_counts() {
     // `73392c7fd1`: one write path skipped the count. Each request below
@@ -2439,17 +2518,27 @@ fn xsa_272_every_way_of_creating_a_node_counts() {
     h.ok(g, MsgType::Mkdir, 0, b"m\0");
     assert_eq!(q(&mut h), "dom5 quota: 6/10");
     assert_eq!(h.err(g, MsgType::Write, 0, &wr("p/q", &"v".repeat(2049))), "E2BIG");
-    assert_eq!(q(&mut h), "dom5 quota: 7/10", "the parent made before the size check");
+    // The parent made before the size check stays and counts; in the
+    // native profile the request makes nothing.
+    let kept = usize::from(!rules().all_or_nothing);
+    assert_eq!(q(&mut h), format!("dom5 quota: {}/10", 6 + kept));
     let t = h.start(g);
     h.write(g, t, "t1", "");
     h.end(g, t, true).unwrap();
-    assert_eq!(q(&mut h), "dom5 quota: 8/10", "a commit as it is");
+    assert_eq!(q(&mut h), format!("dom5 quota: {}/10", 7 + kept), "a commit as it is");
     let t = h.start(g);
     h.write(g, t, "t2", "");
     h.write(a, 0, "/elsewhere", "");
     h.end(g, t, true).unwrap();
-    assert_eq!(q(&mut h), "dom5 quota: 9/10", "a commit re-executed");
+    assert_eq!(
+        q(&mut h),
+        format!("dom5 quota: {}/10", 8 + kept),
+        "a commit re-executed"
+    );
     h.write(g, 0, "last", "");
+    if kept == 0 {
+        h.write(g, 0, "last-but-one", "");
+    }
     // The one that would make 11 changes nothing.
     let before = h.ls(a, 0, "/local/domain/5");
     for (t, p) in [
@@ -2457,50 +2546,83 @@ fn xsa_272_every_way_of_creating_a_node_counts() {
         (MsgType::Mkdir, b"over\0".to_vec()),
         (MsgType::Write, wr("o/v", "")),
     ] {
-        assert_eq!(h.err(g, t, 0, &p), "EQUOTA");
+        assert_eq!(h.err(g, t, 0, &p), quota_error());
     }
     assert_eq!(h.ls(a, 0, "/local/domain/5"), before);
     assert_eq!(q(&mut h), "dom5 quota: 10/10");
     let t = h.start(g);
     assert_eq!(
         h.err(g, MsgType::Write, t, &wr("over", "")),
-        "EQUOTA",
+        quota_error(),
         "in a transaction too"
     );
 }
 
 #[test]
-fn xsa_414_a_failed_creation_keeps_what_it_made_and_its_count() {
+fn xsa_414_what_a_failed_creation_leaves_and_counts() {
     // As oxenstored, whose missing parents are MKDIRs of their own
     // (`ox/process.ml:74-87`): those that fit are made and stay, and
-    // count; the request fails at the first that does not.
+    // count; the request fails at the first that does not. In the native
+    // profile a request that fails makes nothing, in a transaction too;
+    // its answer is the same.
+    let keeps = !rules().all_or_nothing;
+    let big = "v".repeat(2049);
     let (mut h, a, g) = guest_with_quota(5);
     h.watch(a, "/local/domain/5", "w");
     for p in ["x", "y", "z"] {
         h.write(g, 0, p, "");
     }
     h.drain();
+    let root = h.core.root.clone();
     let out = h.raw(g, ty(MsgType::Write), 0, &wr("a/b/c", "v"));
     assert_eq!(
         out,
-        [(g, (ty(MsgType::Error), h.req, 0, b"EQUOTA\0".to_vec()))],
+        [(
+            g,
+            (
+                ty(MsgType::Error),
+                h.req,
+                0,
+                format!("{}\0", quota_error()).into_bytes()
+            )
+        )],
         "and it fires nothing"
     );
-    assert_eq!(
-        h.ls(a, 0, "/local/domain/5/a"),
-        Vec::<String>::new(),
-        "a was made, b was not"
-    );
-    assert_eq!(quota(&mut h, a, 0, "5"), "dom5 quota: 5/5");
-    assert_eq!(h.err(g, MsgType::Write, 0, &wr("w", "")), "EQUOTA");
+    let children = |h: &mut H| h.ls(a, 0, "/local/domain/5");
+    if keeps {
+        assert_eq!(
+            h.ls(a, 0, "/local/domain/5/a"),
+            Vec::<String>::new(),
+            "a was made, b was not"
+        );
+        assert_eq!(quota(&mut h, a, 0, "5"), "dom5 quota: 5/5");
+        assert_eq!(h.err(g, MsgType::Write, 0, &wr("w", "")), "EQUOTA");
+        h.ok(g, MsgType::Rm, 0, b"a\0");
+    } else {
+        assert!(Arc::ptr_eq(&root, &h.core.root), "the store is not even copied");
+        assert_eq!(children(&mut h), ["x", "y", "z"]);
+        assert_eq!(quota(&mut h, a, 0, "5"), "dom5 quota: 4/5");
+    }
     // Room for the parents but not the value: E2BIG after them.
-    h.ok(g, MsgType::Rm, 0, b"a\0");
-    assert_eq!(h.err(g, MsgType::Write, 0, &wr("p/q", &"v".repeat(2049))), "E2BIG");
-    assert_eq!(h.ls(a, 0, "/local/domain/5/p"), Vec::<String>::new());
-    // No room for them: EQUOTA first.
+    assert_eq!(h.err(g, MsgType::Write, 0, &wr("p/q", &big)), "E2BIG");
+    assert_eq!(children(&mut h).contains(&"p".to_string()), keeps);
     h.ok(g, MsgType::Rm, 0, b"p\0");
+    let t = h.start(g);
+    assert_eq!(
+        h.err(g, MsgType::Write, t, &wr("s/u", &big)),
+        "E2BIG",
+        "in a transaction"
+    );
+    assert_eq!(h.read(g, t, "s").is_ok(), keeps, "in its store");
+    h.end(g, t, false).unwrap();
+    // A MKDIR with room for one of its two nodes.
+    assert_eq!(h.err(g, MsgType::Mkdir, 0, b"m/n\0"), quota_error());
+    assert_eq!(children(&mut h).contains(&"m".to_string()), keeps);
+    h.ok(g, MsgType::Rm, 0, b"m\0");
+    // No room for them: the quota first.
     h.write(g, 0, "r", "");
-    assert_eq!(h.err(g, MsgType::Write, 0, &wr("p/q", &"v".repeat(2049))), "EQUOTA");
+    assert_eq!(h.err(g, MsgType::Write, 0, &wr("p/q", &big)), quota_error());
+    assert_eq!(quota(&mut h, a, 0, "5"), "dom5 quota: 5/5");
 }
 
 #[test]
@@ -2533,40 +2655,59 @@ fn the_quota_comes_after_the_size_and_before_the_access() {
 }
 
 #[test]
-fn xsa_419_a_node_counts_for_its_owner_not_for_its_creator() {
+fn xsa_419_who_owns_and_pays_for_a_node_a_guest_creates() {
     // A node gets its parent's permissions, so its owner, and counts for
     // it (`ox/store.ml:415-436`); domain 0 is never held (`ox/quota.ml:58`,
-    // `id > 0`). So a guest that may write a node domain 0 owns creates
-    // as many nodes there as it likes, as in oxenstored 4.17.
+    // `id > 0`): below a node domain 0 owns, a guest's nodes are domain
+    // 0's. In the native profile the guest owns what it creates, the rest
+    // of the ACL its parent's, is counted for it and loses it when it dies.
+    let owns = rules().creator_owns;
     let (mut h, a, g) = guest_with_quota(10);
     h.write(a, 0, "/drop", "");
     h.ok(a, MsgType::SetPerms, 0, b"/drop\0n0\0w5\0");
     for i in 0..100 {
-        h.write(g, 0, &format!("/drop/{i}"), "");
+        let r = h.call(g, MsgType::Write, 0, &wr(&format!("/drop/{i}"), ""));
+        assert_eq!(r.0 == ty(MsgType::Error), owns && i >= 9, "{i}");
     }
-    assert_eq!(quota(&mut h, a, 0, "5"), "dom5 quota: 1/10");
+    if owns {
+        assert_eq!(h.err(g, MsgType::Write, 0, &wr("/drop/x", "")), quota_error());
+        assert_eq!(h.err(g, MsgType::Mkdir, 0, b"/drop/x\0"), quota_error());
+        assert_eq!(quota(&mut h, a, 0, "5"), "dom5 quota: 10/10");
+        assert_eq!(h.one(a, MsgType::GetPerms, "/drop/0"), b"n5\0w5\0");
+        h.dom_exc(&[(5, DomainState::Dead)]);
+        assert_eq!(h.ls(a, 0, "/drop"), Vec::<String>::new(), "gone with it");
+        assert_eq!(quota(&mut h, a, 0, "5"), "dom5 quota: not set");
+    } else {
+        assert_eq!(quota(&mut h, a, 0, "5"), "dom5 quota: 1/10");
+        assert_eq!(h.one(a, MsgType::GetPerms, "/drop/0"), b"n0\0w5\0");
+    }
     // A guest writing in another's tree fills the other's quota, and
-    // what it made stays the other's when it dies.
+    // what it made stays the other's when it dies; in the native profile
+    // it fills its own, and what it made goes.
     let mut h = H::with(Config {
         entity_max: 10,
         ..Config::default()
     });
     let a = h.core.open();
     home(&mut h, a, 6);
-    h.ok(a, MsgType::SetPerms, 0, b"/local/domain/6\0n6\0w5\0");
     for round in 0..5 {
+        // Given again each time: the entry goes with domain 5.
+        h.ok(a, MsgType::SetPerms, 0, b"/local/domain/6\0n6\0w5\0");
         home(&mut h, a, 5);
         let g = h.introduce(a, 5, 1, 1);
         for i in 0..12 {
             let p = format!("/local/domain/6/{round}-{i}");
             let r = h.call(g, MsgType::Write, 0, &wr(&p, ""));
-            assert_eq!(r.3 == b"EQUOTA\0", round > 0 || i >= 9, "{p}");
+            let full = if owns { i >= 9 } else { round > 0 || i >= 9 };
+            assert_eq!(r.3 == format!("{}\0", quota_error()).as_bytes(), full, "{p}");
         }
-        assert_eq!(quota(&mut h, a, 0, "6"), "dom6 quota: 10/10");
+        let (five, six) = if owns { (10, 1) } else { (1, 10) };
+        assert_eq!(quota(&mut h, a, 0, "5"), format!("dom5 quota: {five}/10"));
+        assert_eq!(quota(&mut h, a, 0, "6"), format!("dom6 quota: {six}/10"));
         h.dom_exc(&[(5, DomainState::Dead)]);
         h.calls();
     }
-    assert_eq!(h.ls(a, 0, "/local/domain/6").len(), 9);
+    assert_eq!(h.ls(a, 0, "/local/domain/6").len(), if owns { 0 } else { 9 });
     h.introduce(a, 6, 2, 2);
     h.dom_exc(&[(6, DomainState::Dead)]);
     assert_eq!(quota(&mut h, a, 0, "6"), "dom6 quota: not set");
@@ -2651,7 +2792,7 @@ fn xsa_483_a_dead_or_released_domain_starts_again_from_nothing() {
         for i in 0..9 {
             h.write(g, 0, &format!("n{i}"), "");
         }
-        assert_eq!(h.err(g, MsgType::Write, 0, &wr("n9", "")), "EQUOTA");
+        assert_eq!(h.err(g, MsgType::Write, 0, &wr("n9", "")), quota_error());
         h.write(a, 0, "/local/domain/5/n0/other", "");
         h.ok(a, MsgType::SetPerms, 0, b"/local/domain/5/n0/other\0n7\0");
         end(&mut h, a);
@@ -2903,30 +3044,36 @@ fn domain_0_and_a_domain_acting_for_it_are_not_held_and_a_stub_domain_shares_its
 }
 
 #[test]
-fn xsa_326d_a_guest_may_have_one_more_watch_than_quota_maxwatch() {
+fn xsa_326d_a_guest_s_watches_are_bounded_by_quota_maxwatch() {
     // `con.nb_watches > !Define.maxwatch` (`ox/connection.ml:277-280`):
-    // checked after the path, before EEXIST. Tokens as long as a payload
+    // one more than the quota; exactly the quota in the native profile.
+    // Checked after the path, before EEXIST. Tokens as long as a payload
     // allows cost what the quota bounds.
     let (mut h, a, g) = with_guest(Config {
         watch_max: Some(3),
         ..Config::default()
     });
+    let allowed = if rules().exact_counts { 3 } else { 4 };
     let token = "t".repeat(PAYLOAD_MAX - 30);
     h.watch(g, "/nowhere/1", &token);
     h.watch(g, "/nowhere/1", "other token");
-    h.watch(g, "@releaseDomain", "s");
+    if allowed == 4 {
+        h.watch(g, "@releaseDomain", "s");
+    }
     h.watch(g, "rel", "r");
+    assert_eq!(h.core.conns.map[&g].watches, allowed);
     for p in [&b"/nowhere/2\0t\0"[..], b"/nowhere/1\0other token\0"] {
-        assert_eq!(h.err(g, MsgType::Watch, 0, p), "EQUOTA");
+        assert_eq!(h.err(g, MsgType::Watch, 0, p), quota_error());
     }
     assert_eq!(h.err(g, MsgType::Watch, 0, b"/bad path\0t\0"), "EINVAL");
     h.ok(g, MsgType::Unwatch, 0, b"rel\0r\0");
     h.watch(g, "/n", "t");
-    assert_eq!(h.err(g, MsgType::Watch, 0, b"/n2\0t\0"), "EQUOTA");
+    assert_eq!(h.err(g, MsgType::Watch, 0, b"/n2\0t\0"), quota_error());
     h.ok(g, MsgType::ResetWatches, 0, b"\0");
-    for i in 0..4 {
+    for i in 0..allowed {
         h.watch(g, &format!("/n{i}"), "t");
     }
+    assert_eq!(h.err(g, MsgType::Watch, 0, b"/n9\0t\0"), quota_error());
     h.core.reconnect(g);
     h.drain();
     h.watch(g, "/again", "t");
@@ -2947,21 +3094,27 @@ fn xsa_326d_a_guest_may_have_one_more_watch_than_quota_maxwatch() {
 }
 
 #[test]
-fn xsa_326e_one_more_transaction_than_quota_transaction() {
+fn xsa_326e_a_guest_s_open_transactions_are_bounded_by_quota_transaction() {
     // `Hashtbl.length con.transactions > !Define.maxtransaction`
-    // (`ox/connection.ml:382-385`): after EBUSY.
-    let (mut h, _, g) = with_guest(Config {
+    // (`ox/connection.ml:382-385`): one more than the quota; exactly the
+    // quota in the native profile. After EBUSY.
+    let (mut h, a, g) = with_guest(Config {
         transaction_max: Some(2),
         ..Config::default()
     });
-    let ts: Vec<u32> = (0..3).map(|_| h.start(g)).collect();
-    assert_eq!(h.err(g, MsgType::TransactionStart, 0, b"\0"), "EQUOTA");
+    let allowed = if rules().exact_counts { 2 } else { 3 };
+    let ts: Vec<u32> = (0..allowed).map(|_| h.start(g)).collect();
+    assert_eq!(h.err(g, MsgType::TransactionStart, 0, b"\0"), quota_error());
     assert_eq!(h.err(g, MsgType::TransactionStart, ts[0], b"\0"), "EBUSY");
     h.end(g, ts[1], false).unwrap();
     h.start(g);
-    assert_eq!(h.err(g, MsgType::TransactionStart, 0, b"\0"), "EQUOTA");
+    assert_eq!(h.err(g, MsgType::TransactionStart, 0, b"\0"), quota_error());
     h.ok(g, MsgType::ResetWatches, 0, b"\0");
     h.start(g);
+    // Domain 0 is not held.
+    for _ in 0..10 {
+        h.start(a);
+    }
 }
 
 #[test]
@@ -2988,7 +3141,7 @@ fn xsa_326e_a_transaction_takes_maxrequests_requests_then_nothing_not_even_its_e
         (MsgType::TransactionEnd, b"T\0"),
         (MsgType::TransactionEnd, b"F\0"),
     ] {
-        assert_eq!(h.err(g, ty, t, p), "EQUOTA", "{ty:?}");
+        assert_eq!(h.err(g, ty, t, p), quota_error(), "{ty:?}");
     }
     // The log did not grow; the transaction stays open until reset.
     assert_eq!(h.core.conns.map[&g].txns[&t].log.len(), 2);
@@ -3011,8 +3164,8 @@ fn xsa_326e_a_transaction_takes_maxrequests_requests_then_nothing_not_even_its_e
         request_max: Some(0),
         ..Config::default()
     });
-    assert_eq!(h.err(g, MsgType::Read, 0, b"/local/domain/5\0"), "EQUOTA");
-    assert_eq!(h.err(g, MsgType::Watch, 0, b"w\0t\0"), "EQUOTA");
+    assert_eq!(h.err(g, MsgType::Read, 0, b"/local/domain/5\0"), quota_error());
+    assert_eq!(h.err(g, MsgType::Watch, 0, b"w\0t\0"), quota_error());
     // Without a limit.
     let (mut h, _, g) = with_guest(Config {
         request_max: None,
@@ -4525,9 +4678,11 @@ fn xsa_481_paths_in_the_domain_prefix_are_refused_or_looked_up_as_any() {
                 assert_eq!(h.err(c, t, 0, &payload(t, p)), want, "{c:?} {t:?} {p}");
             }
         }
-        // Valid names, which name no domain.
+        // Valid names, which name no domain; in the native profile a guest,
+        // which may not read /local/domain, is told EACCES.
+        let missing = if native() && c == g { "EACCES" } else { "ENOENT" };
         for p in ["/local/domain/-", "/local/domain/_/x"] {
-            assert_eq!(h.err(c, MsgType::Read, 0, &payload(MsgType::Read, p)), "ENOENT", "{p}");
+            assert_eq!(h.err(c, MsgType::Read, 0, &payload(MsgType::Read, p)), missing, "{p}");
         }
         h.write(c, 0, "/local/domain/5/data", "");
     }
@@ -4599,20 +4754,22 @@ fn a_request_whose_connection_or_transaction_is_gone_fails_with_eio() {
 
 #[test]
 fn a_value_of_the_size_limit_is_written_with_or_without_missing_parents() {
-    let (mut h, a, g) = with_guest(Config::default());
-    let full = "v".repeat(store::VALUE_MAX);
-    for (who, path) in [
-        (g, "made/below/leaf"),
-        (g, "made/leaf"),
-        (a, "/top/made/leaf"),
-        (a, "/top/leaf"),
-    ] {
-        h.write(who, 0, path, &full);
-        assert_eq!(h.read(who, 0, path).unwrap(), full, "{path}");
-    }
-    let over = "v".repeat(store::VALUE_MAX + 1);
-    for path in ["new/below/leaf", "made/other"] {
-        assert_eq!(h.err(g, MsgType::Write, 0, &wr(path, &over)), "E2BIG", "{path}");
+    for profile in PROFILES {
+        let (mut h, a, g) = guest_in(profile, Config::default());
+        let full = "v".repeat(store::VALUE_MAX);
+        for (who, path) in [
+            (g, "made/below/leaf"),
+            (g, "made/leaf"),
+            (a, "/top/made/leaf"),
+            (a, "/top/leaf"),
+        ] {
+            h.write(who, 0, path, &full);
+            assert_eq!(h.read(who, 0, path).unwrap(), full, "{profile:?} {path}");
+        }
+        let over = "v".repeat(store::VALUE_MAX + 1);
+        for path in ["new/below/leaf", "made/other"] {
+            assert_eq!(h.err(g, MsgType::Write, 0, &wr(path, &over)), "E2BIG", "{path}");
+        }
     }
 }
 
@@ -4789,4 +4946,388 @@ fn a_commit_on_an_unchanged_store_publishes_the_transaction_as_it_ran() {
     h.ok(a, MsgType::SetTarget, 0, b"5\x005\0");
     assert_eq!(h.end(g, t, true), Ok(()));
     assert_eq!(h.read(a, 0, "/tool"), Err("ENOENT".into()));
+}
+
+// ------------------------------------------------- the profiles' rules
+
+const PROFILES: [Profile; 2] = [Profile::Oxenstored, Profile::Native];
+
+/// `with_guest`, in `profile`.
+fn guest_in(profile: Profile, cfg: Config) -> (H, ConnId, ConnId) {
+    with_guest(Config { profile, ..cfg })
+}
+
+#[test]
+fn the_rules_of_each_profile() {
+    let ox = Profile::Oxenstored.rules();
+    assert_eq!(ox.quota_error, Errno::EQUOTA);
+    assert!(!ox.exact_counts && !ox.control_is_privileged && !ox.creator_owns);
+    assert!(!ox.all_or_nothing && !ox.hide_missing);
+    let native = Profile::Native.rules();
+    assert_eq!(native.quota_error, Errno::ENOSPC);
+    assert!(native.exact_counts && native.control_is_privileged && native.creator_owns);
+    assert!(native.all_or_nothing && native.hide_missing);
+    assert_eq!(Config::default().profile, Profile::Oxenstored);
+    // A count at the quota is full, or one past it.
+    assert!(!ox.full(3, 3) && ox.full(4, 3) && !ox.full(0, 0) && ox.full(1, 0));
+    assert!(native.full(3, 3) && native.full(4, 3) && !native.full(2, 3) && native.full(0, 0));
+}
+
+#[test]
+fn every_quota_refuses_with_equota_or_with_enospc_in_the_native_profile() {
+    for profile in PROFILES {
+        let e = profile.rules().quota_error.name();
+        let cfg = Config {
+            entity_max: 2,
+            watch_max: Some(1),
+            transaction_max: Some(1),
+            request_max: Some(3),
+            acl_max: 1,
+            transaction_bytes_max: Some(300),
+            ..Config::default()
+        };
+        let (mut h, a, g) = guest_in(profile, cfg);
+        // Nodes: the home and one more.
+        h.write(g, 0, "n", "");
+        assert_eq!(h.err(g, MsgType::Write, 0, &wr("m", "")), e, "{profile:?}");
+        assert_eq!(h.err(g, MsgType::Mkdir, 0, b"m\0"), e);
+        assert_eq!(h.err(g, MsgType::Write, 0, &wr("m/o", "")), e);
+        // ACL entries.
+        assert_eq!(h.err(g, MsgType::SetPerms, 0, b"n\0n5\0r1\0r2\0"), e);
+        // Watches: one, and one more where oxenstored allows it.
+        h.watch(g, "/w1", "t");
+        if profile == Profile::Oxenstored {
+            h.watch(g, "/w2", "t");
+        }
+        assert_eq!(h.err(g, MsgType::Watch, 0, b"/w3\0t\0"), e);
+        // Transactions, likewise.
+        let t = h.start(g);
+        if profile == Profile::Oxenstored {
+            h.start(g);
+        }
+        assert_eq!(h.err(g, MsgType::TransactionStart, 0, b"\0"), e);
+        // Bytes a transaction keeps, then requests in one.
+        h.write(g, t, "n", &"v".repeat(400));
+        assert_eq!(h.err(g, MsgType::Read, t, b"n\0"), e);
+        assert_eq!(h.err(g, MsgType::Read, t, b"n\0"), e);
+        h.ok(g, MsgType::ResetWatches, 0, b"\0");
+        let t = h.start(g);
+        for _ in 0..3 {
+            h.read(g, t, "n").unwrap();
+        }
+        assert_eq!(h.err(g, MsgType::Read, t, b"n\0"), e);
+        // Domain 0 meets none.
+        h.ok(a, MsgType::SetPerms, 0, b"/local/domain/5/n\0n5\0r1\0r2\0");
+        for i in 0..3 {
+            h.watch(a, &format!("/a{i}"), "t");
+            h.start(a);
+        }
+    }
+}
+
+#[test]
+fn control_from_a_guest_is_ok_and_does_nothing_or_is_eacces_in_the_native_profile() {
+    for profile in PROFILES {
+        let (mut h, a, g) = guest_in(profile, Config::default());
+        let stub = h.core.open_domain(7);
+        h.ok(a, MsgType::SetTarget, 0, b"7\x000\0");
+        h.watch(a, "/w", "t");
+        let list = b"watch D7: /s t\nwatch A1: /w t\n\0";
+        h.watch(stub, "/s", "t");
+        for p in [
+            &b"watches\0"[..],
+            b"print\0x\0",
+            b"quota\x005\0",
+            b"mfn\x005\0",
+            b"",
+            b"frob\0",
+        ] {
+            let r = h.call(g, MsgType::Control, 0, p);
+            match profile {
+                Profile::Oxenstored => assert_eq!(r, (ty(MsgType::Control), h.req, 0, b"OK\0".to_vec())),
+                Profile::Native => assert_eq!(r, (ty(MsgType::Error), h.req, 0, b"EACCES\0".to_vec())),
+            }
+            // Domain 0, and a domain acting for it, are served as before.
+            for c in [a, stub] {
+                let r = h.ok(c, MsgType::Control, 0, p);
+                if p == b"watches\0" {
+                    assert_eq!(r, list);
+                }
+            }
+        }
+        // In a transaction: its reply carries the transaction.
+        let t = h.start(g);
+        let r = h.call(g, MsgType::Control, t, b"print\0x\0");
+        assert_eq!((r.0 == ty(MsgType::Error), r.2), (profile == Profile::Native, t));
+    }
+}
+
+#[test]
+fn a_node_a_guest_creates_is_its_own_in_the_native_profile_and_its_parent_s_owner_s_otherwise() {
+    for profile in PROFILES {
+        let native = profile == Profile::Native;
+        let (mut h, a, g) = guest_in(
+            profile,
+            Config {
+                entity_max: 20,
+                ..Config::default()
+            },
+        );
+        let perms = |h: &mut H, p: &str| String::from_utf8(h.one(a, MsgType::GetPerms, p)).unwrap();
+        let count = |h: &mut H, d: &str| quota(h, a, 0, d);
+        h.write(a, 0, "/open", "");
+        h.ok(a, MsgType::SetPerms, 0, b"/open\0n0\0w5\0r6\0");
+        // Missing parents and the node: one record, owner and ACL.
+        h.write(g, 0, "/open/a/b/c", "v");
+        let want = if native { "n5\0w5\0r6\0" } else { "n0\0w5\0r6\0" };
+        for p in ["/open/a", "/open/a/b", "/open/a/b/c"] {
+            assert_eq!(perms(&mut h, p), want, "{profile:?} {p}");
+        }
+        let node = |h: &H, p: &str| lookup(&h.core.root, &parse_absolute(p).unwrap()).unwrap().perms.clone();
+        assert!(Arc::ptr_eq(&node(&h, "/open/a"), &node(&h, "/open/a/b/c")), "shared");
+        assert_eq!(
+            Arc::ptr_eq(&node(&h, "/open"), &node(&h, "/open/a")),
+            !native,
+            "the parent's record, unless the owner changes"
+        );
+        assert_eq!(
+            count(&mut h, "5"),
+            if native { "dom5 quota: 4/20" } else { "dom5 quota: 1/20" }
+        );
+        // Below its own home, the parent's record as it is.
+        h.write(g, 0, "mine/x", "");
+        assert!(Arc::ptr_eq(
+            &node(&h, "/local/domain/5"),
+            &node(&h, "/local/domain/5/mine/x")
+        ));
+        // Domain 0 creating below a guest's node: the guest's, as before.
+        h.write(a, 0, "/open/a/by0", "");
+        assert_eq!(perms(&mut h, "/open/a/by0"), want);
+        // The new owner may change the ACL, not give the node away.
+        if native {
+            h.ok(g, MsgType::SetPerms, 0, b"/open/a\0n5\0r7\0");
+            assert_eq!(h.err(g, MsgType::SetPerms, 0, b"/open/a\0n0\0"), "EACCES");
+        } else {
+            assert_eq!(h.err(g, MsgType::SetPerms, 0, b"/open/a\0n5\0r7\0"), "EACCES");
+        }
+        // In a transaction, committed as it is or run again.
+        for again in [false, true] {
+            let t = h.start(g);
+            let p = format!("/open/t{again}");
+            h.write(g, t, &format!("{p}/x"), "");
+            if again {
+                h.write(a, 0, "/elsewhere", "");
+            }
+            h.end(g, t, true).unwrap();
+            assert_eq!(perms(&mut h, &p), if native { "n5\0w5\0r6\0" } else { "n0\0w5\0r6\0" });
+        }
+        // A stub domain acting for the guest owns what it creates, as C
+        // xenstored has it (`conn->id`); one acting for domain 0 is
+        // domain 0.
+        let stub = h.core.open_domain(7);
+        h.ok(a, MsgType::SetTarget, 0, b"7\x005\0");
+        h.write(stub, 0, "/local/domain/5/by-stub", "");
+        let by_stub = perms(&mut h, "/local/domain/5/by-stub");
+        assert_eq!(by_stub, if native { "n7\0" } else { "n5\0" });
+        h.ok(a, MsgType::SetTarget, 0, b"7\x000\0");
+        h.write(stub, 0, "/open/by-dom0-stub", "");
+        assert_eq!(perms(&mut h, "/open/by-dom0-stub"), "n0\0w5\0r6\0");
+        // The guest dies: what it owns goes, wherever it is.
+        h.dom_exc(&[(5, DomainState::Dead)]);
+        let left = h.ls(a, 0, "/open");
+        let want_left: &[&str] = if native {
+            &["by-dom0-stub"]
+        } else {
+            &["a", "by-dom0-stub", "tfalse", "ttrue"]
+        };
+        assert_eq!(left, want_left, "{profile:?}");
+        assert_eq!(count(&mut h, "5"), "dom5 quota: not set");
+    }
+}
+
+#[test]
+fn a_failed_write_or_mkdir_changes_nothing_in_the_native_profile() {
+    for profile in PROFILES {
+        let keeps = profile == Profile::Oxenstored;
+        let (mut h, a, g) = guest_in(
+            profile,
+            Config {
+                entity_max: 3,
+                ..Config::default()
+            },
+        );
+        h.watch(a, "/", "all");
+        h.drain();
+        // Room for two of the three parents: the quota.
+        let before = h.core.root.clone();
+        let e = profile.rules().quota_error.name();
+        assert_eq!(h.err(g, MsgType::Write, 0, &wr("a/b/c/d", "")), e);
+        assert_eq!(Arc::ptr_eq(&before, &h.core.root), !keeps, "{profile:?}");
+        assert!(h.drain().is_empty(), "nothing fires");
+        assert_eq!(h.read(a, 0, "/local/domain/5/a/b").is_ok(), keeps);
+        h.ok(a, MsgType::Rm, 0, b"/local/domain/5/a\0");
+        // Room for both parents but not the node: the quota, after them.
+        assert_eq!(h.err(g, MsgType::Write, 0, &wr("a/b/c", "")), e);
+        assert_eq!(h.read(a, 0, "/local/domain/5/a/b").is_ok(), keeps);
+        h.ok(a, MsgType::Rm, 0, b"/local/domain/5/a\0");
+        // The size, after the parents.
+        assert_eq!(h.err(g, MsgType::Write, 0, &wr("a/b", &"v".repeat(2049))), "E2BIG");
+        assert_eq!(h.read(a, 0, "/local/domain/5/a").is_ok(), keeps);
+        h.ok(a, MsgType::Rm, 0, b"/local/domain/5/a\0");
+        // Room for the parents only, and a value too long: the size, before
+        // the quota of the node.
+        assert_eq!(h.err(g, MsgType::Write, 0, &wr("a/b/c", &"v".repeat(2049))), "E2BIG");
+        assert_eq!(h.read(a, 0, "/local/domain/5/a/b").is_ok(), keeps);
+        h.ok(a, MsgType::Rm, 0, b"/local/domain/5/a\0");
+        // Domain 0 is not held: the size alone.
+        let before = h.core.root.clone();
+        assert_eq!(h.err(a, MsgType::Write, 0, &wr("/d/e/f", &"v".repeat(2049))), "E2BIG");
+        assert_eq!(Arc::ptr_eq(&before, &h.core.root), !keeps);
+        assert_eq!(h.read(a, 0, "/d/e").is_ok(), keeps);
+        h.ok(a, MsgType::Rm, 0, b"/d\0");
+        // In a transaction, its version is left as it was.
+        let t = h.start(g);
+        let version = h.core.conns.map[&g].txns[&t].tree.clone();
+        assert_eq!(h.err(g, MsgType::Mkdir, t, b"m/n/o\0"), e);
+        let after = h.core.conns.map[&g].txns[&t].tree.clone();
+        assert_eq!(Arc::ptr_eq(&version, &after), !keeps);
+        assert_eq!(h.read(g, t, "m").is_ok(), keeps);
+        h.end(g, t, true).unwrap();
+        // What does fit is made.
+        h.write(g, 0, "a/b", "");
+        assert_eq!(quota(&mut h, a, 0, "5"), "dom5 quota: 3/3");
+    }
+}
+
+#[test]
+fn a_missing_node_below_one_a_guest_may_not_read_is_enoent_or_eacces_in_the_native_profile() {
+    for profile in PROFILES {
+        let native = profile == Profile::Native;
+        let (mut h, a, g) = guest_in(profile, Config::default());
+        h.write(a, 0, "/closed/open/x", "");
+        h.write(a, 0, "/open/x", "");
+        h.write(a, 0, "/wonly/x", "");
+        h.ok(a, MsgType::SetPerms, 0, b"/closed/open\0n0\0b5\0");
+        h.ok(a, MsgType::SetPerms, 0, b"/open\0n0\0b5\0");
+        h.ok(a, MsgType::SetPerms, 0, b"/wonly\0n0\0w5\0");
+        let hidden = if native { "EACCES" } else { "ENOENT" };
+        let reads = |p: &str| {
+            [
+                (MsgType::Read, format!("{p}\0")),
+                (MsgType::Directory, format!("{p}\0")),
+                (MsgType::GetPerms, format!("{p}\0")),
+                (MsgType::DirectoryPart, format!("{p}\x000\0")),
+            ]
+        };
+        for t in [0, h.start(g)] {
+            for (p, want) in [
+                ("/closed/missing", hidden),
+                ("/closed/missing/deeper", hidden),
+                ("/wonly/missing", hidden),
+                ("/closed/open/missing", "ENOENT"),
+                ("/closed/open/missing/deeper", "ENOENT"),
+                ("/open/missing", "ENOENT"),
+                ("/local/domain/5/missing", "ENOENT"),
+                // A node that exists and may not be read: as before.
+                ("/closed", "EACCES"),
+            ] {
+                for (ty, payload) in reads(p) {
+                    assert_eq!(
+                        h.err(g, ty, t, payload.as_bytes()),
+                        want,
+                        "{profile:?} {ty:?} {p} in {t}"
+                    );
+                }
+            }
+            // RM and SET_PERMS ask for write access.
+            for (p, rm, set) in [
+                ("/closed/missing", if native { Some("EACCES") } else { None }, hidden),
+                ("/closed/missing/deeper", Some(hidden), hidden),
+                ("/wonly/missing", None, "ENOENT"),
+                ("/wonly/missing/deeper", Some("ENOENT"), "ENOENT"),
+                ("/open/missing", None, "ENOENT"),
+            ] {
+                let r = h.call(g, MsgType::Rm, t, format!("{p}\0").as_bytes());
+                let got = (r.0 == ty(MsgType::Error)).then(|| String::from_utf8(r.3).unwrap());
+                assert_eq!(
+                    got.as_deref(),
+                    rm.map(|e| format!("{e}\0")).as_deref(),
+                    "{profile:?} RM {p}"
+                );
+                let perms = format!("{p}\0n5\0");
+                assert_eq!(h.err(g, MsgType::SetPerms, t, perms.as_bytes()), set, "{p}");
+            }
+        }
+        // Domain 0, and a guest acting for it, may read everything.
+        let stub = h.core.open_domain(7);
+        h.ok(a, MsgType::SetTarget, 0, b"7\x000\0");
+        for c in [a, stub] {
+            for (ty, payload) in reads("/closed/missing") {
+                assert_eq!(h.err(c, ty, 0, payload.as_bytes()), "ENOENT");
+            }
+            assert_eq!(h.err(c, MsgType::Rm, 0, b"/closed/missing/deeper\0"), "ENOENT");
+            h.ok(c, MsgType::Rm, 0, b"/closed/missing\0");
+        }
+    }
+}
+
+/// The XSA regression tests, run again with every core the harness makes
+/// in the native profile (`in_profile`): each asserts there what the
+/// native rules give (`native()`, `rules()`, `quota_error()`).
+mod in_the_native_profile {
+    use super::*;
+
+    macro_rules! native {
+        ($($test:ident,)*) => {
+            $(
+                #[test]
+                fn $test() {
+                    in_profile(Profile::Native, super::$test)
+                }
+            )*
+        };
+    }
+
+    native! {
+        xsa_272_every_way_of_creating_a_node_counts,
+        xsa_414_what_a_failed_creation_leaves_and_counts,
+        xsa_419_who_owns_and_pays_for_a_node_a_guest_creates,
+        xsa_483_a_dead_or_released_domain_starts_again_from_nothing,
+        xsa_421_create_then_delete_in_one_transaction_counts_nothing,
+        xsa_440_two_transactions_removing_the_same_nodes_count_once,
+        xsa_326d_a_guest_s_watches_are_bounded_by_quota_maxwatch,
+        xsa_326e_a_guest_s_open_transactions_are_bounded_by_quota_transaction,
+        xsa_326e_a_transaction_takes_maxrequests_requests_then_nothing_not_even_its_end,
+        xsa_326a_a_guest_that_does_not_read_its_replies_has_at_most_maxoutstanding,
+        xsa_326b_a_guest_flooding_a_socket_that_does_not_read_is_held_and_the_socket_kept,
+        xsa_326c_a_guest_flooding_a_guest_that_does_not_read_is_held_and_domain_0_never,
+        xsa_326f_a_guest_removing_what_a_socket_watches_is_held_too,
+        xsa_206_a_guest_that_keeps_failing_a_transaction_is_held_until_credit_comes_back,
+        xsa_206_a_domain_0_transaction_commits_while_a_guest_hammers_what_it_read,
+        xsa_206_blame_that_skips_what_a_transaction_cannot_see_blames_the_same,
+        xsa_206_domain_0_and_sockets_are_never_held,
+        xsa_206_an_innocent_guest_is_not_blamed_for_the_conflicts_of_others,
+        xsa_206_a_commit_is_recorded_and_blamed_as_a_change,
+        xsa_206_history_is_kept_only_for_young_transactions,
+        xsa_206_credit_comes_back_a_point_a_period_to_one_domain_or_to_each,
+        xsa_206_a_point_at_a_time_up_to_the_limit_and_nothing_for_who_is_gone,
+        xsa_206_with_an_infinite_limit_nothing_changes,
+        xsa_206_with_no_credit_to_start_with_a_guest_is_never_served,
+        xsa_206_with_a_limit_of_one_a_conflict_pauses_and_a_point_resumes,
+        xsa_325_a_guest_that_breaks_the_protocol_is_ignored_and_its_domain_still_dies,
+        xsa_420_any_length_past_a_payload_ends_the_ring_once,
+        xsa_115_a_commit_s_events_are_checked_against_the_store_before_and_after_the_transaction,
+        xsa_72_after_e2big_a_ring_goes_on_and_directory_part_lists_it_all,
+        xsa_322_a_dead_domain_s_acl_entries_do_not_come_back_with_a_transaction,
+        xsa_323_the_length_limit_is_on_the_part_after_the_domain_s_home,
+        xsa_324_after_an_oversized_event_a_ring_goes_on,
+        xsa_330_and_512_reset_and_reconnection_leave_no_watch_behind,
+        xsa_352_a_guest_cannot_give_a_node_away_in_a_transaction_either,
+        xsa_353_the_root_is_checked_as_any_node,
+        xsa_416_a_ring_that_does_not_read_is_held_at_the_soft_limit,
+        xsa_417_permissions_granted_before_a_domain_exists_end_with_it,
+        xsa_418_the_deepest_paths_a_request_can_name_fit_in_the_stack,
+        xsa_481_paths_in_the_domain_prefix_are_refused_or_looked_up_as_any,
+        xsa_484_reset_watches_in_a_transaction_ends_it,
+    }
 }

@@ -582,13 +582,24 @@ fn sigterm_and_sigint_stop_the_daemon_cleanly() {
 #[test]
 fn command_line() {
     let bin = env!("CARGO_BIN_EXE_rxenstored");
-    let out = Command::new(bin).arg("--help").output().unwrap();
+    let out = Command::new(bin)
+        .args(["--compat=oxenstored", "--help"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("--socket"));
-    let out = Command::new(bin).arg("--nope").output().unwrap();
+    let out = Command::new(bin)
+        .args(["--compat=oxenstored", "--nope"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let out = Command::new(bin)
-        .args(["--no-domain-init", "--socket", "/proc/no/such/dir/socket"])
+        .args([
+            "--compat=oxenstored",
+            "--no-domain-init",
+            "--socket",
+            "/proc/no/such/dir/socket",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));

@@ -102,6 +102,10 @@ impl Daemon {
             }
             _ => Command::new(&spec.exe),
         };
+        if spec.kind == Kind::Rx {
+            // oxenstored's command line and oxenstored.conf, as oxenstored gets.
+            cmd.arg("--compat=oxenstored");
+        }
         cmd.args(["--no-domain-init", "--no-fork", "--config-file"])
             .arg(&conf_path)
             .env_remove("NOTIFY_SOCKET")

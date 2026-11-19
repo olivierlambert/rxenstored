@@ -1,21 +1,24 @@
 # Design
 
-rxenstored replaces oxenstored 4.17 as XCP-ng 8.3 runs it. The contract comes first, then
-how the daemon is built.
+rxenstored has two modes. By default it is a xenstored of its own: its command line, its
+configuration file and the native behaviour below. With `--compat=oxenstored` it replaces
+oxenstored 4.17 as XCP-ng 8.3 runs it. The compatibility contract comes first, then the
+native mode, then how the daemon is built.
 
-## The compatibility contract
+## The compatibility contract (`--compat=oxenstored`)
 
 **Kept as oxenstored 4.17 has it.**
 
-- Start-up: the stock `launch-xenstore` runs it with oxenstored's arguments; it reads
+- Start-up: the stock `launch-xenstore` runs it with oxenstored's arguments after
+  `--compat=oxenstored`; it reads
   `/etc/xen/oxenstored.conf` with oxenstored 4.17's grammar (every key checked, warnings as
   oxenstored gives them, errors under `--config-test`; four keys are not honoured, below),
   writes the pid file, daemonises and sends `READY=1` to systemd. SIGTERM and SIGINT stop it,
   SIGHUP reopens the logs.
 - Transports: the same unix socket, dom0's ring from `/dev/xen/xenbus_backend`
   (falling back to `/proc/xen/xsd_kva` and `/proc/xen/xsd_port`, which are used as configured
-  when `xenstored-kva` or `xenstored-port` name other paths; the device path has not run on
-  a host yet), guest rings by foreign mapping of the gfn that INTRODUCE gives, the
+  when `xenstored-kva` or `xenstored-port` name other paths; the device path has run on a
+  test host, the fallback only in tests), guest rings by foreign mapping of the gfn that INTRODUCE gives, the
   RECONNECTION ring feature advertised, domain state through Xen 4.17's domctl (interface
   version 0x15).
 - Semantics of every request it serves: permissions, the XSA-115 check of watch events,
@@ -57,22 +60,55 @@ commits whose own change made it fail; a guest's watch path is limited to `quota
 its ACL to 256 entries; the root node is never counted in quotas; when the event-channel
 device reports lost notifications, every ring is examined.
 
-**Kept although debatable**, each pinned by a test:
+**Kept although debatable** (compatibility mode; native differs, below), each pinned by a test:
 
 | Behaviour | Why it is debatable | Test |
 |---|---|---|
-| Nodes a guest creates below a dom0-owned node it may write belong to dom0, which has no quota | a quota bypass of the XSA-419 class | `xsa_419_a_node_counts_for_its_owner_not_for_its_creator` |
+| Nodes a guest creates below a dom0-owned node it may write belong to dom0, which has no quota | a quota bypass of the XSA-419 class | `xsa_419_who_owns_and_pays_for_a_node_a_guest_creates` |
 | `quota-maxwatch` and `quota-transaction` allow one more than their value | off by one, but guests and tools may count on it | `xsa_326d_…`, `xsa_326e_…` |
-| A failing WRITE keeps the parents it created | leaves nodes behind | `xsa_414_a_failed_creation_keeps_what_it_made_and_its_count` |
+| A failing WRITE keeps the parents it created | leaves nodes behind | `xsa_414_what_a_failed_creation_leaves_and_counts` |
 | `@releaseDomain` fires at every `VIRQ_DOM_EXC` while any domain is shut down | event storms | `a_dead_domain_loses_its_connection_nodes_and_acl_entries_and_release_domain_fires_once` |
-| `RM` of a node whose parent is missing is `ENOENT` | the protocol text suggests OK | `rm_semantics` |
 
 **Not supported**: live update in either direction (`--live` and `--restart` are refused,
 `CONTROL live-update` and `CONTROL xenbus` answer `ENOSYS`); the `audit` log mode; `CONTROL
-stats` and `trace`. C xenstored's command-line flags are not accepted; oxenstored's `-T`
-(trace file) is accepted and ignored, with a warning.
-Grant mapping of guest rings exists in `xs-sys`, behind its `gnttab` feature (off by
+stats` and `trace`. oxenstored's `-T` (trace file) is accepted and ignored, with a warning.Grant mapping of guest rings exists in `xs-sys`, behind its `gnttab` feature (off by
 default); it cannot be selected from the configuration and has not run on a host.
+
+## Native mode
+
+Without `--compat=oxenstored`. Not run on a host yet.
+
+- Command line (`rxenstored --help`): `-N/--no-fork`, `-F/--pid-file`, `-D/--no-domain-init`
+  and `-T/--trace-file` (accepted, ignored) as both C xenstored and oxenstored have them;
+  `-Q/--quota NAME=VALUE` as C xenstored; `-c/--config-file`, `--config-test`,
+  `--disable-socket`, `--no-access-log`, `--socket`, `--version`. C xenstored's other flags
+  are not accepted. An unknown option stops the start.
+- Configuration: `/etc/xen/rxenstored.conf`, one `KEY = VALUE` per line. An unknown key, a
+  key set twice or a bad value stops the start, with its line number. Quotas are
+  `quota-NAME`, with C xenstored's names where the limit means the same (`nodes`, `watches`,
+  `transactions`, `outstanding`, `path-max`, `node-permissions`); 0 means no limit. The
+  command line wins over the file. There is no switch to turn permission or quota checks
+  off.
+- Default quotas, C xenstored's: 1,000 nodes, 128 watches, 10 transactions, 20 outstanding
+  replies, 5 permission entries per node (its owner's included), 2,048-byte values and
+  relative paths, 1,024 requests per transaction.
+- The daemon log goes to `syslog:daemon`; there is no access log unless configured. The
+  unix socket is created with mode 0600.
+
+Where its behaviour differs from the compatibility mode:
+
+- A quota refuses with `ENOSPC`.
+- A quota of N allows N watches and N open transactions per connection.
+- `CONTROL` from a guest is answered `EACCES`; domain 0's commands are unchanged.
+- A node a guest creates is owned by that guest (the rest of its permissions are its
+  parent's), counts in the guest's node quota, and is removed when the guest goes.
+- A `WRITE` or `MKDIR` that fails creates nothing.
+- A request on a node that does not exist is answered `EACCES` rather than `ENOENT` when
+  the caller may not access the nearest existing node above it (read access for `READ`,
+  `DIRECTORY`, `DIRECTORY_PART`, `GET_PERMS`; write access for `RM`, `SET_PERMS`).
+
+Checked by the same model test with the model switched to these rules, on the same number
+of sequences, and by the XSA regression tests run in both modes.
 
 ## How it is built
 

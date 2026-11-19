@@ -1,6 +1,8 @@
 # rxenstored
 
-A xenstore daemon written in Rust, meant to replace oxenstored on XCP-ng 8.3 (Xen 4.17).
+A xenstore daemon written in Rust, with its own command line and configuration, and a
+compatibility mode in which it replaces oxenstored on XCP-ng 8.3 (Xen 4.17). Every
+measurement below is of the compatibility mode; the native mode has not run on a host.
 
 > **Status: experimental, not production-ready.** It was written with AI assistance and has
 > not yet been reviewed line by line by a human. It has served guests on two hosts only
@@ -68,9 +70,10 @@ xenstored. With 500 guests, oxenstored (XAPI) used about half of C xenstored's d
   synthetic before-and-after run showed no CPU difference), two fixes (access-log loss
   accounting, back-off on failed accepts) and the changes since. Of the benchmarks, only the
   40-guest one was run again on the 4-core Intel host, once on each later build: 5.15 s of
-  daemon CPU for the 40 starts on the code first published and 5.09 s on the current code,
-  against the measured build's 5.25 s; every other phase within the spread of the earlier
-  runs, memory equal or lower, and no operation failed.
+  daemon CPU for the 40 starts on the code first published, then 5.09 s, 5.02 s and 5.08 s on
+  later code (the last started with `--compat=oxenstored`), against the measured build's
+  5.25 s; every other phase within or just under the
+  spread of the earlier runs, memory equal or lower, and no operation failed.
 - **oxenstored (Xen 4.17) was not fresh**: 8.2 MB resident before the EPYC ramp after two
   trial runs (the others: 0.9 to 2.1 MB); on the Intel host, 130.7 MB and 478 more nodes
   left by earlier runs.
@@ -88,9 +91,12 @@ Limitations below; the details are in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## What "drop-in" covers
 
-It keeps oxenstored 4.17's socket, dom0 ring and guest ring mapping, command line,
-`oxenstored.conf` grammar, quotas, conflict credit, access-log format, and its replies to
-every request rxenstored serves; the deliberate differences, and the debatable behaviours
+Started with `--compat=oxenstored`, it keeps oxenstored 4.17's socket, dom0 ring and guest
+ring mapping, command line, `oxenstored.conf` grammar, quotas, conflict credit, access-log
+format, and its replies to every request rxenstored serves. Without that option it reads its
+own command line and `/etc/xen/rxenstored.conf` (`rxenstored --help`), with C xenstored's
+quota names and default quotas, and behaves as [`docs/DESIGN.md`](docs/DESIGN.md) lists
+under "Native mode". For the compatibility mode, the deliberate differences, and the debatable behaviours
 kept, are listed in [`docs/DESIGN.md`](docs/DESIGN.md). How it was checked: a model test
 compares replies, events and the store with a hand-written model of oxenstored's behaviour on
 450 seeded random sequences; on one host, over the same 40-guest run, the toolstack's logs
@@ -107,10 +113,15 @@ guest.
     cargo build --release --target x86_64-unknown-linux-musl -p xs-daemon
 
 Copy `target/x86_64-unknown-linux-musl/release/rxenstored` to `/usr/sbin/rxenstored` in dom0,
-add the line `XENSTORED=/usr/sbin/rxenstored` to `/etc/sysconfig/xencommons` and reboot: the
-stock `launch-xenstore` starts what that line names, with `--pid-file /var/run/xen/xenstored.pid`
-and `XENSTORED_ARGS`. To go back, remove the line and reboot. Both were booted once on one
-XCP-ng 8.3 host. The daemon and access logs go where `oxenstored.conf` says; start-up messages
+add these two lines to `/etc/sysconfig/xencommons` and reboot:
+
+    XENSTORED=/usr/sbin/rxenstored
+    XENSTORED_ARGS=--compat=oxenstored
+
+The stock `launch-xenstore` starts what the first line names, with
+`--pid-file /var/run/xen/xenstored.pid` and `XENSTORED_ARGS`. To go back, remove both lines
+and reboot: oxenstored refuses `--compat`, so a second line left behind stops the host's
+xenstore from starting. One XCP-ng 8.3 host was booted this way. The daemon and access logs go where `oxenstored.conf` says; start-up messages
 go to the service's journal, which on that host ended in `/var/log/daemon.log` under
 `launch-xenstore`. To replace a running rxenstored, delete the old file first: it is in use.
 xenstored cannot be restarted on a running host, so each switch is a reboot, which stops the
@@ -125,9 +136,8 @@ access first, and do not do this on a host whose guests matter.
 The gates and what they prove: [`docs/TESTING.md`](docs/TESTING.md). To run the daemon without
 Xen, on its own socket (`--help` lists the options):
 
-    mkdir -p /tmp/rxs && printf '%s\n' "pid-file = /tmp/rxs/pid" \
-        "xenstored-log-file = /tmp/rxs/xenstored.log" "access-log-file = /tmp/rxs/access.log" >/tmp/rxs/conf
-    target/release/rxenstored --no-fork --no-domain-init --config-file /tmp/rxs/conf --socket /tmp/rxs/socket
+    mkdir -p /tmp/rxs && printf '%s\n' "log = /tmp/rxs/xenstored.log" "access-log = /tmp/rxs/access.log" >/tmp/rxs/conf
+    target/release/rxenstored -N -D -c /tmp/rxs/conf -F /tmp/rxs/pid --socket /tmp/rxs/socket
 
 ## Security
 
@@ -143,7 +153,7 @@ list, the known limits, and how to report a vulnerability: [`docs/SECURITY.md`](
 - A domain's death walks the whole store; each `VIRQ_DOM_EXC` asks Xen about every domain.
 - There is no per-guest memory bound and no transaction age limit: the quotas bound counts,
   not the memory a guest can make dom0 hold in total.
-- Where oxenstored 4.17's behaviour is debatable it is kept: [`docs/DESIGN.md`](docs/DESIGN.md).
+- In compatibility mode, where oxenstored 4.17's behaviour is debatable it is kept: [`docs/DESIGN.md`](docs/DESIGN.md).
 - Not there yet: `CONTROL stats` and `trace`, the `audit` log mode, the `-T` trace file.
 - Not tested: PV or PVH guests, migration between hosts, more than 500 guests, runs of days,
   Windows guests beyond a few Windows Server 2022 ones.

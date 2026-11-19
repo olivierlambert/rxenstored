@@ -1,0 +1,16 @@
+quota-nodes = 1
+not a setting
+= 3
+quota-nodes = 2
+log-level = loud
+log = x # comment
+quota-maxentity = 8192
+persistent = false
+quota-watches = 99999999999999999999
+log = syslog:local8
+access-log = syslog:local07
+conflict-burst-limit = 0
+conflict-max-history-seconds = 1e3
+ring-scan-interval = 1..0
+access-log-read-ops = yes
+quota-transaction-bytes = x
