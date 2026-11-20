@@ -61,15 +61,20 @@ mode; the core against the model, in both modes; the ring; the wire decoder; the
 configuration file and the command line of each mode; the log formatter. Before the first
 campaign, 12 bugs were planted one at a time (quota off by one, a skipped permission check, a
 ring index wrap, an unescaped log byte…): each was found by a target that could see it, the
-slowest in 240 s. Two campaigns of one night each, on 4-core VMs. The first (2026-11-17):
-about 14 process-hours and 131 million executions; it found one bug in the daemon, in the
-accounting of queued watch events, now fixed with a regression test, and one error in the
-model. The second (2026-11-19): 48 process-hours and 739 million executions (the core with
-invariants 21.6 h, the core against the model 14.4 h, the ring under AddressSanitizer 6.0 h,
-the six others 6.1 h); it found no bug in the daemon, one error in the model and one case the
-invariants did not allow for. No crash, hang or memory error in either. The second night ran
-before the native mode's behaviour was written: the native core target has run for minutes
-only. That is hours, not the weeks a fuzzing campaign should run.
+slowest in 240 s. Three campaigns of one night each, on 4-core VMs. The first
+(2026-11-17): about 14 process-hours and 131 million executions; it found one bug in the
+daemon, in the accounting of queued watch events, now fixed with a regression test, and one
+error in the model. The second (2026-11-19): 48 process-hours and 739 million executions; no
+bug in the daemon, one error in the model and one case the invariants did not allow for. The
+third (2026-11-20), on the code with both modes: 48 process-hours and 808 million executions
+(the core with invariants 15.6 h in compatibility mode and 6.0 h in native mode, the core
+against the model 14.4 h, the ring under AddressSanitizer 6.0 h, the six others 6.0 h); no
+bug in the daemon, one more case the invariants did not allow for. After that change to the
+invariants, four permission checks were removed from the core one at a time: each was found
+by at least one of the two core targets within 80 s (one of them only when started from the
+night's corpus), and neither target found all four in 5 minutes. No
+crash, hang or memory error in any night. At the end of the third, the core targets were
+still reaching new code slowly; the model and ring targets had stopped. That is hours, not the weeks a fuzzing campaign should run.
 
 **Miri** (`scripts/miri.sh`), which detects undefined behaviour in the code it runs, runs the
 unit tests of `xs-wire`, the model test of `xs-core` with 2 seeds of 150 steps, 26 of the 31

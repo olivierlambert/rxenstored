@@ -107,8 +107,9 @@ normal test suite, and the input a seed.
   sequences shaped like the XSA regression tests of `crates/xs-core/src/tests.rs` (named
   `xsa-NNN-…`), the transaction byte quota, CONTROL `quota` in a transaction, the events of a
   commit. The others are inputs kept as regression inputs: a node named `@/` under the root,
-  the root's owner gone after a RELEASE, and commits after SET_TARGET or the RELEASE of the
-  target changed the connection's rights during its transaction.
+  the root's owner gone after a RELEASE, commits after SET_TARGET or the RELEASE of the
+  target changed the connection's rights during its transaction, and transactions that
+  remove the root's children, then make paths below the root again.
 - `core_vs_model`: the first steps of the model test's seeded sequences, as choice bytes
   (`XS_FUZZ_SEEDS=DIR cargo test -p xs-core --test model -- --ignored` writes them), in each
   profile (`model-seed-*`, `model-native-seed-*`), a commit after SET_TARGET changed the

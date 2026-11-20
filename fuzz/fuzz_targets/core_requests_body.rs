@@ -538,6 +538,8 @@ struct OpenTxn {
     /// requests made it, with the rights they had then; otherwise its
     /// requests run again with the rights of the commit.
     ran_as: Vec<oracle::Who>,
+    /// The paths of its RM requests answered OK.
+    removed: Vec<Vec<Vec<u8>>>,
 }
 
 /// What a queued message is.
@@ -1194,8 +1196,14 @@ impl H {
                     OpenTxn {
                         start,
                         ran_as: Vec::new(),
+                        removed: Vec::new(),
                     },
                 );
+            }
+            MsgType::Rm if ok && tid != 0 => {
+                if let (Some(p), Some(t)) = (comps(&absolute(f[0], &home)), self.slots[i].txns.get_mut(&tid)) {
+                    t.removed.push(p);
+                }
             }
             MsgType::TransactionEnd => {
                 // Ended, committed or not, unless refused before: a bad
@@ -1335,17 +1343,50 @@ impl H {
         }
         let can = |p: &[Vec<u8>]| whos.iter().any(|w| may(before, p, *w, b'w'));
         let show = |p: &[Vec<u8>]| String::from_utf8_lossy(&oracle::show(p)).into_owned();
+        // Removed and created again in a committed transaction: an RM of the
+        // transaction removed the node or an ancestor, then a request made
+        // the node again. Each node from it up has the permissions a node
+        // created below its parent gets (with the guest as owner in the
+        // native profile), up to a parent it may write: a creation of
+        // missing parents makes each of them so, from the nearest existing
+        // one down.
+        let native = PROFILE == Profile::Native;
+        let removed: &[Vec<Vec<u8>>] = match (end, &self.ended) {
+            (true, Some(t)) => &t.removed,
+            _ => &[],
+        };
+        let again = |p: &[Vec<u8>]| {
+            if !removed.iter().any(|r| p.starts_with(r)) {
+                return false;
+            }
+            let mut q = p;
+            while let (true, Some((_, parent))) = (end, q.split_last()) {
+                let made = match (after.get(parent), after.get(q)) {
+                    (Some(a), Some(n)) => oracle::created(&a.perms, h.who, native) == n.perms,
+                    _ => false,
+                };
+                if !made {
+                    return false;
+                }
+                if can(parent) {
+                    return true;
+                }
+                q = parent;
+            }
+            false
+        };
         for (p, n) in after {
             match before.get(p) {
                 None => {
-                    // Created: the nearest node that existed was writable.
+                    // Created: the nearest node that existed was writable,
+                    // or was removed and created again.
                     let a = (0..p.len())
                         .rev()
                         .map(|k| &p[..k])
                         .find(|a| before.contains_key(*a))
                         .unwrap();
                     assert!(
-                        can(a),
+                        can(a) || again(a),
                         "domain {} created {} below {}, which it may not write",
                         s.domid,
                         show(p),
@@ -1353,24 +1394,14 @@ impl H {
                     );
                 }
                 Some(old) if old != n => {
-                    let parent = &p[..p.len().saturating_sub(1)];
-                    // Removed and created again in a transaction: the
-                    // parent's permissions (with the guest as owner in the
-                    // native profile), which it may write.
-                    let native = PROFILE == Profile::Native;
-                    let again = end
-                        && !p.is_empty()
-                        && after
-                            .get(parent)
-                            .is_some_and(|q| oracle::created(&q.perms, h.who, native) == n.perms)
-                        && can(parent);
+                    let made_again = again(p);
                     assert!(
-                        can(p) || again,
+                        can(p) || made_again,
                         "domain {} changed {}, which it may not write",
                         s.domid,
                         show(p)
                     );
-                    if old.perms != n.perms && !again {
+                    if old.perms != n.perms && !made_again {
                         let (o, o2) = (owner(&old.perms), owner(&n.perms));
                         assert_eq!(o, o2, "domain {} gave {} away", s.domid, show(p));
                         assert!(
@@ -1391,13 +1422,14 @@ impl H {
         }
         for p in before.keys().filter(|p| !after.contains_key(*p)) {
             // Removed: the top of what went was writable (or the root, for
-            // a removal of the root).
+            // a removal of the root), or its parent was removed and created
+            // again in a committed transaction.
             let mut top: &[Vec<u8>] = p;
             while top.len() > 1 && !after.contains_key(&top[..top.len() - 1]) {
                 top = &top[..top.len() - 1];
             }
             assert!(
-                can(top) || (top.len() == 1 && can(&[])),
+                can(top) || (top.len() == 1 && can(&[])) || again(&top[..top.len() - 1]),
                 "domain {} removed {}, which it may not write",
                 s.domid,
                 show(p)

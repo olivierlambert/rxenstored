@@ -4948,6 +4948,51 @@ fn a_commit_on_an_unchanged_store_publishes_the_transaction_as_it_ran() {
     assert_eq!(h.read(a, 0, "/tool"), Err("ENOENT".into()));
 }
 
+/// A guest that may write the root (domain 0 gave it the right) removes the
+/// root's children in a transaction, then makes a path below the root: each
+/// missing parent is made again with its parent's permissions, as
+/// oxenstored's implicit MKDIRs make them (`ox/store.ml:302-305`,
+/// `ox/process.ml:74-87`, `ox/store.ml:259-266`). Its commit publishes
+/// that, whether nothing was committed since (the version as it is) or
+/// something was (the requests run again).
+#[test]
+fn a_transaction_that_removes_the_root_makes_the_parents_of_a_path_again_with_the_root_s_permissions() {
+    for changed in [false, true] {
+        let (mut h, a, g) = guest_in(Profile::Oxenstored, Config::default());
+        h.ok(a, MsgType::SetPerms, 0, b"/\0n0\0b5\0");
+        let t = h.start(g);
+        h.ok(g, MsgType::Rm, t, b"/\0");
+        h.ok(g, MsgType::Mkdir, t, b"/local/domain/1/memory\0");
+        if changed {
+            h.write(a, 0, "/x", "v");
+        }
+        assert_eq!(h.end(g, t, true), Ok(()), "changed since: {changed}");
+        for p in ["/local", "/local/domain", "/local/domain/1/memory"] {
+            assert_eq!(h.one(a, MsgType::GetPerms, p), b"n0\0b5\0", "{p}");
+        }
+        assert_eq!(h.read(a, 0, "/local/domain/5"), Err("ENOENT".into()));
+        assert_eq!(h.read(a, 0, "/x"), Err("ENOENT".into()));
+    }
+}
+
+/// C xenstored refuses to remove the root, whoever asks
+/// (`cx417/xenstored_core.c:1725-1726`, `cx/core.c:1787`); oxenstored
+/// removes the root's children (`ox/store.ml:302-305`), and so does the
+/// native profile today. An open question: whether the native profile
+/// should answer as C does here.
+#[test]
+#[ignore = "native profile: RM of the root removes its children, as oxenstored's does; C answers EINVAL"]
+fn in_the_native_profile_rm_of_the_root_is_einval() {
+    let (mut h, a, g) = guest_in(Profile::Native, Config::default());
+    h.ok(a, MsgType::SetPerms, 0, b"/\0n0\0b5\0");
+    assert_eq!(h.err(g, MsgType::Rm, 0, b"/\0"), "EINVAL");
+    let t = h.start(g);
+    assert_eq!(h.err(g, MsgType::Rm, t, b"/\0"), "EINVAL");
+    h.end(g, t, false).unwrap();
+    assert_eq!(h.err(a, MsgType::Rm, 0, b"/\0"), "EINVAL");
+    assert_eq!(h.read(a, 0, "/local/domain/5"), Ok(String::new()));
+}
+
 // ------------------------------------------------- the profiles' rules
 
 const PROFILES: [Profile; 2] = [Profile::Oxenstored, Profile::Native];
