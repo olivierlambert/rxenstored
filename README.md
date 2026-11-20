@@ -25,6 +25,9 @@ its xenstored. *Daemon CPU*: user plus system time of the daemon process, all th
 | Reboot 25 guests: wall time, mean of 3 rounds | 177 s | 60.2 s | 106 s | 45.0 s |
 | Idle with 500 guests: daemon CPU per minute | 21.1 s | 5.56 s | 5.55 s | 0.72 s |
 | Daemon memory (RSS) with 500 guests | 89.2 MB, not started fresh | 87.0 MB | 61.3 MB | 31.1 MB |
+| Daemon memory before the first start | 8.2 MB, not started fresh | 7.2 MB | 2.1 MB | 0.9 MB |
+| Daemon memory once all 500 were stopped | 140.1 MB | 127.7 MB | 42.9 MB | 14.4 MB |
+| Daemon memory per running guest (least squares) | 167 KB | 158 KB | 129 KB | 60 KB |
 
 oxenstored (XAPI), the newer out-of-tree oxenstored, ran on a second server of the same
 model. Newer C xenstored releases were not measured. XCP-ng 8.3 ships both oxenstored and C
@@ -38,6 +41,13 @@ squares; rxenstored went from 2.35 s for the first batch to 3.31 s for the last)
 rxenstored a batch still went from 25 s at 25 guests to 38 s at 500; the daemon was on the CPU
 for under 9 % of that time. oxenstored (XAPI)'s batches took as long as rxenstored's, within
 2.5 s, with its daemon on the CPU for 71 % of the last one.
+
+![Daemon memory while starting 500 guests](docs/img/epyc-memory.svg)
+
+Memory grew in a line with the guests for each daemon. Stopping the 500 guests gave back
+about half of rxenstored's and a third of C xenstored's; both oxenstoreds were larger after
+the stops than with 500 guests running: they went from 87 to 89 MB to about 127 MB around the
+listing of the whole store that follows the ramp.
 
 ![With 500 guests running: operations and the daemon at rest](docs/img/epyc-500-up.svg)
 
@@ -75,7 +85,7 @@ xenstored. With 500 guests, oxenstored (XAPI) used about half of C xenstored's d
   5.25 s; every other phase within or just under the
   spread of the earlier runs, memory equal or lower, and no operation failed.
 - **oxenstored (Xen 4.17) was not fresh**: 8.2 MB resident before the EPYC ramp after two
-  trial runs (the others: 0.9 to 2.1 MB); on the Intel host, 130.7 MB and 478 more nodes
+  trial runs (the others, fresh: 0.9 to 7.2 MB); on the Intel host, 130.7 MB and 478 more nodes
   left by earlier runs.
 - **Single runs**, hours to a day apart; C xenstored on a fresh install of the same server
   model, oxenstored (XAPI) on a second server of the same model. No run shown here had a failed operation.
