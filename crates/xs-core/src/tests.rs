@@ -4977,11 +4977,9 @@ fn a_transaction_that_removes_the_root_makes_the_parents_of_a_path_again_with_th
 
 /// C xenstored refuses to remove the root, whoever asks
 /// (`cx417/xenstored_core.c:1725-1726`, `cx/core.c:1787`); oxenstored
-/// removes the root's children (`ox/store.ml:302-305`), and so does the
-/// native profile today. An open question: whether the native profile
-/// should answer as C does here.
+/// removes the root's children (`ox/store.ml:302-305`). The native
+/// profile answers as C does.
 #[test]
-#[ignore = "native profile: RM of the root removes its children, as oxenstored's does; C answers EINVAL"]
 fn in_the_native_profile_rm_of_the_root_is_einval() {
     let (mut h, a, g) = guest_in(Profile::Native, Config::default());
     h.ok(a, MsgType::SetPerms, 0, b"/\0n0\0b5\0");
@@ -5007,11 +5005,11 @@ fn the_rules_of_each_profile() {
     let ox = Profile::Oxenstored.rules();
     assert_eq!(ox.quota_error, Errno::EQUOTA);
     assert!(!ox.exact_counts && !ox.control_is_privileged && !ox.creator_owns);
-    assert!(!ox.all_or_nothing && !ox.hide_missing);
+    assert!(!ox.all_or_nothing && !ox.hide_missing && !ox.root_stays);
     let native = Profile::Native.rules();
     assert_eq!(native.quota_error, Errno::ENOSPC);
     assert!(native.exact_counts && native.control_is_privileged && native.creator_owns);
-    assert!(native.all_or_nothing && native.hide_missing);
+    assert!(native.all_or_nothing && native.hide_missing && native.root_stays);
     assert_eq!(Config::default().profile, Profile::Oxenstored);
     // A count at the quota is full, or one past it.
     assert!(!ox.full(3, 3) && ox.full(4, 3) && !ox.full(0, 0) && ox.full(1, 0));

@@ -179,6 +179,10 @@ pub struct Rules {
     /// RM and SET_PERMS), and EACCES to others (`cx417/xenstored_core.c:936-950`);
     /// without it, ENOENT to everybody (`ox/store.ml:178-181`).
     pub hide_missing: bool,
+    /// RM of the root is EINVAL to a caller that may write it
+    /// (`cx417/xenstored_core.c:1725-1726`); without it, it removes the
+    /// root's children (`ox/store.ml:302-305`).
+    pub root_stays: bool,
 }
 
 impl Profile {
@@ -192,6 +196,7 @@ impl Profile {
                 creator_owns: false,
                 all_or_nothing: false,
                 hide_missing: false,
+                root_stays: false,
             },
             Profile::Native => Rules {
                 quota_error: Errno::ENOSPC,
@@ -200,6 +205,7 @@ impl Profile {
                 creator_owns: true,
                 all_or_nothing: true,
                 hide_missing: true,
+                root_stays: true,
             },
         }
     }

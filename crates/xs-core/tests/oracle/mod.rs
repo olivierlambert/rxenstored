@@ -6,7 +6,7 @@
 //! which drives the same generator with the fuzzer's bytes instead of a
 //! seeded random generator: every choice is a `Source::below`.
 //!
-//! With the native profile (`Profile::Native`) the model follows its six
+//! With the native profile (`Profile::Native`) the model follows its seven
 //! rules (`xs_core::Rules`) and is oxenstored's otherwise: quotas refuse
 //! with ENOSPC; a quota of N allows N watches and N transactions; CONTROL
 //! from a guest is EACCES; a guest owns, and is counted for, the nodes it
@@ -406,6 +406,9 @@ pub fn op_mkdir(store: &mut Store, p: P, who: Who, e: Ent, changes: &mut Vec<Cha
 pub fn op_rm(store: &mut Store, p: P, who: Who, native: bool, changes: &mut Vec<Change>) -> R {
     if p.is_empty() {
         check(store, &p, who, b'w')?;
+        if native {
+            return Err("EINVAL");
+        }
         let before = store.clone();
         store.retain(|k, _| k.is_empty());
         changes.push(Change::Rm(p, before));

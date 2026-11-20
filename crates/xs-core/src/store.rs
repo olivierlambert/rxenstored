@@ -502,8 +502,13 @@ fn run(
         }
         Op::Rm(p) => {
             let Some((name, parent)) = p.split_last() else {
-                // Removing the root removes its children (`ox/store.ml:302-305`).
+                // Removing the root removes its children (`ox/store.ml:302-305`),
+                // or with `Rules::root_stays` is refused
+                // (`cx417/xenstored_core.c:1725-1726`).
                 ctx.can(root, Access::Write)?;
+                if ctx.rules.root_stays {
+                    return Err(Errno::EINVAL);
+                }
                 for (_, c) in root.children.iter() {
                     acct.remove_tree(c);
                 }

@@ -103,6 +103,7 @@ Where its behaviour differs from the compatibility mode:
 - A node a guest creates is owned by that guest (the rest of its permissions are its
   parent's), counts in the guest's node quota, and is removed when the guest goes.
 - A `WRITE` or `MKDIR` that fails creates nothing.
+- `RM` of the root is refused with `EINVAL`.
 - A request on a node that does not exist is answered `EACCES` rather than `ENOENT` when
   the caller may not access the nearest existing node above it (read access for `READ`,
   `DIRECTORY`, `DIRECTORY_PART`, `GET_PERMS`; write access for `RM`, `SET_PERMS`).
