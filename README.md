@@ -2,7 +2,8 @@
 
 A xenstore daemon written in Rust, with its own command line and configuration, and a
 compatibility mode in which it replaces oxenstored on XCP-ng 8.3 (Xen 4.17). Every
-measurement below is of the compatibility mode; the native mode has not run on a host.
+measurement below is of the compatibility mode; the native mode has run on one host, for one
+40-guest benchmark ([`docs/DESIGN.md`](docs/DESIGN.md)).
 
 > **Status: experimental, not production-ready.** It was written with AI assistance and has
 > not yet been reviewed line by line by a human. It has served guests on two hosts only

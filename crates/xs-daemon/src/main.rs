@@ -247,7 +247,11 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(Plan::Version) => {
-            let _ = writeln!(io::stdout(), "rxenstored {}", env!("CARGO_PKG_VERSION"));
+            // The commit, when the build knew it (`build.rs`).
+            let _ = match option_env!("RXENSTORED_COMMIT") {
+                Some(c) => writeln!(io::stdout(), "rxenstored {} ({c})", env!("CARGO_PKG_VERSION")),
+                None => writeln!(io::stdout(), "rxenstored {}", env!("CARGO_PKG_VERSION")),
+            };
             return ExitCode::SUCCESS;
         }
         Ok(Plan::ConfigValid(path)) => {

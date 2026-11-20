@@ -37,7 +37,7 @@ usage: rxenstored [OPTION]...
                           watch-events, transaction-bytes
   -T, --trace-file FILE   trace file (not implemented: ignored, with a warning)
   -h, -H, --help          print this and exit
-      --version           print the version and exit
+      --version           print the version and the commit, and exit
       --compat=oxenstored oxenstored's command line and /etc/xen/oxenstored.conf
                           instead of these (rxenstored --compat=oxenstored --help)
 ";

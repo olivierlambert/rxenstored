@@ -76,7 +76,7 @@ default); it cannot be selected from the configuration and has not run on a host
 
 ## Native mode
 
-Without `--compat=oxenstored`. Not run on a host yet.
+Without `--compat=oxenstored`. It has run on one host, for one 40-guest benchmark (below).
 
 - Command line (`rxenstored --help`): `-N/--no-fork`, `-F/--pid-file`, `-D/--no-domain-init`
   and `-T/--trace-file` (accepted, ignored) as both C xenstored and oxenstored have them;
@@ -110,6 +110,16 @@ Where its behaviour differs from the compatibility mode:
 
 Checked by the same model test with the model switched to these rules, on the same number
 of sequences, and by the XSA regression tests run in both modes.
+
+On one XCP-ng 8.3 host (4 cores), booted with the default quotas above and the access log
+switched on for comparison: the host's own guests came back with their devices, the same
+40-guest benchmark as the compatibility mode ran with no failed operation and 5.06 s of
+daemon CPU for the 40 starts (5.08 s in compatibility mode), and two Windows Server 2022
+guests connected their PV drivers. No quota refused anything: guests held at most 185 nodes
+and 14 watches, and domain 0 is not held to the quotas. The one visible difference was 20
+`EACCES` replies where the compatibility mode answers `ENOENT`, to guest frontends reading
+a backend node just removed during unplugs; every unplug and plug succeeded. One run; not
+run with the default of no access log, nor with other toolstacks.
 
 ## How it is built
 

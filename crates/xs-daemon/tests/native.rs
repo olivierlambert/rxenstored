@@ -264,9 +264,14 @@ fn help_version_and_config_test() {
     assert!(String::from_utf8_lossy(&o.stdout).starts_with("usage: rxenstored --compat=oxenstored"));
     let o = run(&["--version"]);
     assert!(o.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&o.stdout),
-        format!("rxenstored {}\n", env!("CARGO_PKG_VERSION"))
+    // The version, then the commit in brackets when the build knew it.
+    let v = String::from_utf8_lossy(&o.stdout).into_owned();
+    let rest = v
+        .strip_prefix(&format!("rxenstored {}", env!("CARGO_PKG_VERSION")))
+        .expect(&v);
+    assert!(
+        rest == "\n" || (rest.starts_with(" (") && rest.ends_with(")\n") && rest.lines().count() == 1),
+        "{v}"
     );
     let d = Dir::new();
     let good = d.conf("quota-nodes = 8192\n");
