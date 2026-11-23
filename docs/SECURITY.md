@@ -71,5 +71,7 @@ Two more regression tests cover behaviours beyond the XSAs:
   a guest can build within its quotas.
 - **The ring page** is written by the guest while the daemon reads it. Every access to it is
   atomic (Miri reported the earlier volatile accesses as data races) and each byte is read
-  once and never trusted. Rust says nothing about memory written from outside the program.
+  once and never trusted. Its read and write code is model-checked against any page contents,
+sequentially and within bounds ([`TESTING.md`](TESTING.md)). Rust says nothing about memory
+written from outside the program.
 - **Not done**: an external review. Fuzzing has only started: see [`TESTING.md`](TESTING.md).

@@ -154,7 +154,13 @@ Xen, on its own socket (`--help` lists the options):
 
 xenstored runs in dom0 and serves every guest. Of the 33 Xen security advisories about
 xenstore (XSA-38 to XSA-514), 25 have a regression test here, 7 do not apply, and XSA-419 is
-handled as oxenstored 4.17 handles it. It has been fuzzed ([`docs/TESTING.md`](docs/TESTING.md)); there has been no external review. The
+handled as oxenstored 4.17 handles it. The code that reads and writes the ring shared with a
+guest is checked with a bounded model checker (Kani): for every state a guest can leave in
+the page, it stays inside the page, does not panic, refuses inconsistent indices and moves
+exactly the bytes it reports. That check is sequential and bounded (short buffers at the real
+ring size, any buffer length at small ring sizes) and covers the ring only, not the daemon.
+The daemon has been fuzzed; there has been no external review. Both are described in
+[`docs/TESTING.md`](docs/TESTING.md). The
 list, the known limits, and how to report a vulnerability: [`docs/SECURITY.md`](docs/SECURITY.md).
 
 ## Limitations

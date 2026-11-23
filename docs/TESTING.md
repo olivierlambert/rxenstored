@@ -31,6 +31,7 @@ None of the tests needs Xen or root. What they cover:
 | Lint | `scripts/lint.sh` | clippy reports nothing on any target; the no-panic lints of `Cargo.toml` are denied in all code that is not a test, except in `xs-bench` | `rustup component add clippy` |
 | no_std | `scripts/nostd.sh [TARGET]` | `xs-wire` and `xs-core` build, and pass clippy, without `std` (default `x86_64-unknown-none`) | `rustup target add x86_64-unknown-none` |
 | Coverage | `scripts/coverage.sh [CRATE...]` | 100 % of lines and regions for `xs-wire` and `xs-core`, 95 % of lines for `xs-sys` and `xs-daemon`; every exclusion listed, with its reason, in [`coverage-exclusions.md`](coverage-exclusions.md) | `cargo install --locked cargo-llvm-cov`, `rustup component add llvm-tools-preview` |
+| Proofs | `scripts/kani.sh [HARNESS...]` | every harness is proved and every case it is meant to cover is reachable (below) | `cargo install --locked kani-verifier`, `cargo kani setup` |
 | Mutation | `scripts/mutants.sh CRATE [--max-missed N]` | no missed mutant in `xs-core` and `xs-wire` (every small change cargo-mutants makes to the code fails a test); in `xs-sys` and `xs-daemon` each missed one is accounted for below | `cargo install --locked cargo-mutants` |
 
 Coverage shows that a line ran; a missed mutant shows that the line could be wrong with no
@@ -51,6 +52,60 @@ while its earlier requests are held); `log/format.rs`: 529 mutants, 524 caught, 
 missed that tests added since kill. 14 mutants equivalent by arithmetic alone are excluded
 in `.cargo/mutants.toml`, each with its reason. These runs predate the last changes to the
 log queue and the transaction byte quota.
+
+## Proofs of the ring
+
+    scripts/kani.sh        # about 100 minutes on 4 cores; needs 5 GB of free memory
+
+The code that reads and writes the page shared with a guest (`crates/xs-sys/src/ring.rs`:
+`read`, `write`, the reconnection, about 100 lines) is checked with
+[Kani](https://github.com/model-checking/kani), a bounded model checker: each of the 38
+harnesses of `crates/xs-sys/src/ring_proofs.rs` is proved for every value of its inputs, not
+for samples. The guest is modelled as the page's contents: when a harness starts, every byte
+of the page is arbitrary, so every pair of indices (2^32 x 2^32) and every content of both
+queues is covered.
+
+What is proved, for a read and for a write:
+
+- no access outside the page, no misaligned access, no panic, no arithmetic overflow;
+- indices that describe more than the queue holds are refused, with the two values read, and
+  then nothing in the page changes;
+- otherwise the count returned is exactly what the buffer and the queue allow; one index
+  moves, by that count, modulo 2^32; no other byte of the page changes (a read changes no
+  queue byte; a write changes only the bytes it reports, in its own queue);
+- the bytes moved are the right ones, in order; bytes written then read come back in order,
+  in both directions;
+- each index is read once per operation, so a guest that changes it meanwhile cannot make
+  the daemon use two different values;
+- the layout behind the `unsafe` blocks: every word is inside the page, aligned, after both
+  queues, and overlaps nothing.
+
+The bounds, which are the limits of the result:
+
+- **At the real queue size (1,024 bytes)**, the code the daemon runs: buffers of up to 32
+  bytes for a read, up to 8 for the bytes moved, for a write and for a write followed by a
+  read. Longer buffers do not fit in the memory of the machine used (7 GB).
+- **At queue sizes of 4, 8, 16 and 32 bytes**: buffers from empty to longer than two queues,
+  so longer than the free space, than what is queued and than the queue itself; the
+  reconnection (both queues filled, the four indices 0, nothing else changed); at 4 bytes,
+  two sequences of four operations compared with a model of the queue. Not every check fits
+  at every size: the header of `scripts/kani.sh` says which run. The queue size is a
+  constant of the same source code, so this is a strong argument that the result holds at
+  1,024, not a proof of it.
+- **Sequential only.** Kani runs one thread and treats an atomic access as a plain one: this
+  proves the algorithm against any state a guest can leave between two operations, not
+  against a guest writing during one. That is what the Miri runs below exercise, for the
+  schedules they run.
+- **Not covered**: the real mapping of a guest's page (the proofs use a heap page), the
+  daemon's use of the ring, and everything outside `ring.rs`. The results rest on Kani, on
+  CBMC and its SAT solver, and on Kani's model of the standard library.
+
+A proof that cannot fail proves nothing: 28 faults were planted in `ring.rs` one at a time (a
+check removed or off by one, a missing mask, a wrong offset, an index advanced wrongly, a
+second read of an index, a queue left unfilled by the reconnection…). 27 make a harness
+fail. The one that does not removes a memory fence, which a sequential proof cannot see.
+Three of the faults cannot be seen at 1,024 bytes (two need buffers longer than those proved
+there, one has no effect at that size); the harnesses at small sizes catch them. Writing the proofs found no defect in the ring.
 
 ## Not tested here
 

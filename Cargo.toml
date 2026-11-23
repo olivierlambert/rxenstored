@@ -40,3 +40,8 @@ exit = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
 unchecked_time_subtraction = "deny"
+
+# `cfg(kani)`: the proof harnesses of xs-sys's ring, built only by
+# `cargo kani` (scripts/kani.sh).
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

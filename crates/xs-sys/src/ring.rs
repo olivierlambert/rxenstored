@@ -50,8 +50,6 @@ pub const ERROR_COMM: u32 = 1;
 pub const ERROR_RINGIDX: u32 = 2;
 pub const ERROR_PROTO: u32 = 3;
 
-const MASK: u32 = RING_SIZE as u32 - 1;
-
 /// The words after the two queues, in page order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -75,9 +73,11 @@ impl Field {
         Field::Error,
     ];
 
-    /// Byte offset in the page: 4-aligned, and the last word ends at 2076.
-    fn offset(self) -> usize {
-        2 * RING_SIZE + 4 * self as usize
+    /// Byte offset in a page whose queues hold `N` bytes each: after the
+    /// two queues, 4-aligned (`N` is a multiple of 4, `Page::VALID`), and
+    /// the last word ends at `2 * N + 28` (2076 for `RING_SIZE`).
+    fn offset<const N: usize>(self) -> usize {
+        2 * N + 4 * self as usize
     }
 }
 
@@ -116,24 +116,37 @@ struct Queue {
     prod: Field,
 }
 
-const REQUESTS: Queue = Queue {
-    data: 0,
-    cons: Field::ReqCons,
-    prod: Field::ReqProd,
-};
-const REPLIES: Queue = Queue {
-    data: RING_SIZE,
-    cons: Field::RspCons,
-    prod: Field::RspProd,
-};
-
-/// The algorithm, common to both views.
-struct Page {
+/// The algorithm, common to both views, for queues of `N` bytes each:
+/// `RING_SIZE` on a real page; the proofs (`ring_proofs.rs`) also take
+/// smaller ones.
+struct Page<const N: usize> {
     map: Mapping,
 }
 
-impl Page {
-    fn new(map: Mapping) -> io::Result<Page> {
+impl<const N: usize> Page<N> {
+    /// The queue sizes the layout allows, checked when the code is built:
+    /// a power of two (an index is masked), at least 4 (the words after
+    /// the queues are then 4-aligned), and the two queues and the seven
+    /// words within a page (so `N` fits in a `u32` too).
+    const VALID: () = {
+        assert!(N.is_power_of_two() && N >= 4 && N <= (PAGE_SIZE - 28) / 2);
+    };
+
+    const MASK: u32 = N as u32 - 1;
+
+    const REQUESTS: Queue = Queue {
+        data: 0,
+        cons: Field::ReqCons,
+        prod: Field::ReqProd,
+    };
+    const REPLIES: Queue = Queue {
+        data: N,
+        cons: Field::RspCons,
+        prod: Field::RspProd,
+    };
+
+    fn new(map: Mapping) -> io::Result<Page<N>> {
+        let () = Self::VALID;
         if map.len() < PAGE_SIZE {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a ring needs a whole page"));
         }
@@ -152,25 +165,30 @@ impl Page {
     /// The word `f`. The peer may write it at any time: an atomic load
     /// reads it exactly once and whole.
     fn word(&self, f: Field) -> &AtomicU32 {
-        // SAFETY: `f.offset() + 4 <= 2076 < PAGE_SIZE <= map.len()`, so the
-        // word is inside the mapping, which lives as long as `self`; it is
-        // 4-aligned (`new` checks the page is aligned, and the offset is a
-        // multiple of 4). This module accesses it only as an `AtomicU32`
-        // (the queues, `queue`, end where the words start).
-        unsafe { AtomicU32::from_ptr(self.map.as_ptr().add(f.offset()).cast()) }
+        // SAFETY: `f.offset::<N>() + 4 <= 2 * N + 28 <= PAGE_SIZE <=
+        // map.len()` (`VALID`, `new`), so the word is inside the mapping,
+        // which lives as long as `self`; it is 4-aligned (`new` checks the
+        // page is aligned, and the offset is a multiple of 4 as `N` is).
+        // This module accesses it only as an `AtomicU32` (the queues,
+        // `queue`, end where the words start).
+        unsafe { AtomicU32::from_ptr(self.map.as_ptr().add(f.offset::<N>()).cast()) }
     }
 
     /// The bytes of the queue `q` from index `at` (masked) to its end, then
     /// those from its start: the order in which the queue's bytes follow
-    /// one another from `at`.
+    /// one another from `at`. The callers iterate over the two by
+    /// reference: by value (`array::IntoIter`) the same loop costs the
+    /// Kani proofs ten times the memory (scripts/kani.sh).
     fn queue(&self, q: Queue, at: u32) -> [&[AtomicU8]; 2] {
-        // SAFETY: `q.data + RING_SIZE <= 2 * RING_SIZE < PAGE_SIZE <=
-        // map.len()`: the queue is inside the mapping, which lives as long
-        // as `self`. An `AtomicU8` has the size and alignment of a `u8`, and
-        // this module accesses the queues only as `AtomicU8`.
-        let all: &[AtomicU8] = unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(q.data).cast(), RING_SIZE) };
-        // `at & MASK < RING_SIZE`: the split always succeeds.
-        let (before, from) = all.split_at_checked((at & MASK) as usize).unwrap_or_default();
+        // SAFETY: `q` is this page's `REQUESTS` or `REPLIES` (the only
+        // queues the module gives a `Page<N>`), so `q.data + N <= 2 * N <
+        // PAGE_SIZE <= map.len()` (`VALID`, `new`): the queue is inside the
+        // mapping, which lives as long as `self`. An `AtomicU8` has the size
+        // and alignment of a `u8`, and this module accesses the queues only
+        // as `AtomicU8`.
+        let all: &[AtomicU8] = unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(q.data).cast(), N) };
+        // `at & MASK < N`: the split always succeeds.
+        let (before, from) = all.split_at_checked((at & Self::MASK) as usize).unwrap_or_default();
         [from, before]
     }
 
@@ -189,7 +207,7 @@ impl Page {
         // No byte may be read before the producer index that covers it.
         fence(Ordering::SeqCst);
         let queued = prod.wrapping_sub(cons);
-        if queued > RING_SIZE as u32 {
+        if queued > N as u32 {
             return Err(CorruptRing { cons, prod });
         }
         let n = buf.len().min(queued as usize);
@@ -199,7 +217,7 @@ impl Page {
         // The peer may be writing these bytes (only a hostile one would):
         // each is read once, and nothing is assumed of its value.
         let mut to = buf.iter_mut().take(n);
-        for part in self.queue(q, cons) {
+        for part in &self.queue(q, cons) {
             for (shared, b) in part.iter().zip(to.by_ref()) {
                 *b = shared.load(Ordering::Relaxed);
             }
@@ -218,15 +236,15 @@ impl Page {
         // place has been read.
         fence(Ordering::SeqCst);
         let queued = prod.wrapping_sub(cons);
-        if queued > RING_SIZE as u32 {
+        if queued > N as u32 {
             return Err(CorruptRing { cons, prod });
         }
-        let n = bytes.len().min(RING_SIZE - queued as usize);
+        let n = bytes.len().min(N - queued as usize);
         if n == 0 {
             return Ok(0);
         }
         let mut from = bytes.iter().take(n);
-        for part in self.queue(q, prod) {
+        for part in &self.queue(q, prod) {
             for (shared, &b) in part.iter().zip(from.by_ref()) {
                 shared.store(b, Ordering::Relaxed);
             }
@@ -236,11 +254,37 @@ impl Page {
         self.set(q.prod, prod.wrapping_add(n as u32));
         Ok(n)
     }
+
+    /// `connection`, written after everything before it.
+    fn set_connection(&mut self, v: u32) {
+        fence(Ordering::SeqCst);
+        self.set(Field::Connection, v);
+    }
+
+    /// The server's half of a reconnection (`Ring::reconnect`).
+    fn reconnect(&mut self) {
+        // As oxenstored does: indices back to 0 and the queues full of
+        // 0xff, which reads as an invalid message type.
+        for q in [Self::REQUESTS, Self::REPLIES] {
+            for part in &self.queue(q, 0) {
+                for shared in *part {
+                    shared.store(0xff, Ordering::Relaxed);
+                }
+            }
+        }
+        for f in [Field::ReqCons, Field::ReqProd, Field::RspCons, Field::RspProd] {
+            self.set(f, 0);
+        }
+        self.set_connection(CONNECTED);
+    }
 }
+
+/// The page of a real ring.
+type RingPage = Page<RING_SIZE>;
 
 /// The server's view of a ring page: reads requests, writes replies.
 pub struct Ring {
-    page: Page,
+    page: RingPage,
 }
 
 impl Ring {
@@ -251,12 +295,12 @@ impl Ring {
 
     /// Moves up to `buf.len()` request bytes into `buf`; 0: none queued.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, CorruptRing> {
-        self.page.read(REQUESTS, buf)
+        self.page.read(RingPage::REQUESTS, buf)
     }
 
     /// Queues as many reply bytes as fit; 0: the reply queue is full.
     pub fn write(&mut self, bytes: &[u8]) -> Result<usize, CorruptRing> {
-        self.page.write(REPLIES, bytes)
+        self.page.write(RingPage::REPLIES, bytes)
     }
 
     pub fn server_features(&self) -> u32 {
@@ -278,8 +322,7 @@ impl Ring {
     }
 
     pub fn set_connection(&mut self, v: u32) {
-        fence(Ordering::SeqCst);
-        self.page.set(Field::Connection, v);
+        self.page.set_connection(v);
     }
 
     pub fn error(&self) -> u32 {
@@ -298,24 +341,14 @@ impl Ring {
     /// word while it waits, so resetting its indices too is allowed. The
     /// daemon drops the connection's state first and notifies after.
     pub fn reconnect(&mut self) {
-        // As oxenstored does: indices back to 0 and the queues full of
-        // 0xff, which reads as an invalid message type.
-        for q in [REQUESTS, REPLIES] {
-            for shared in self.page.queue(q, 0).into_iter().flatten() {
-                shared.store(0xff, Ordering::Relaxed);
-            }
-        }
-        for f in [Field::ReqCons, Field::ReqProd, Field::RspCons, Field::RspProd] {
-            self.page.set(f, 0);
-        }
-        self.set_connection(CONNECTED);
+        self.page.reconnect();
     }
 }
 
 /// The guest's view of a ring page: writes requests, reads replies. It
 /// can also write any word, as a buggy or hostile guest would.
 pub struct GuestRing {
-    page: Page,
+    page: RingPage,
 }
 
 impl GuestRing {
@@ -326,12 +359,12 @@ impl GuestRing {
 
     /// Queues as many request bytes as fit; 0: the request queue is full.
     pub fn write(&mut self, bytes: &[u8]) -> Result<usize, CorruptRing> {
-        self.page.write(REQUESTS, bytes)
+        self.page.write(RingPage::REQUESTS, bytes)
     }
 
     /// Moves up to `buf.len()` reply bytes into `buf`; 0: none queued.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, CorruptRing> {
-        self.page.read(REPLIES, buf)
+        self.page.read(RingPage::REPLIES, buf)
     }
 
     /// Sets `connection` to `RECONNECT`; then the guest notifies and waits
@@ -349,6 +382,13 @@ impl GuestRing {
         self.page.set(f, v);
     }
 }
+
+// Kani proofs of `Page` (`read`, `write`, `reconnect`, `new`) and of the
+// layout, at `RING_SIZE` and at smaller queue sizes (sequential, bounded):
+// scripts/kani.sh.
+#[cfg(kani)]
+#[path = "ring_proofs.rs"]
+mod proofs;
 
 #[cfg(test)]
 mod tests {
